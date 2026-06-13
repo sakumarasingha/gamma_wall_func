@@ -78,6 +78,13 @@ public class ElonMoneyFunction
             return;
         }
 
+        // ── Market holiday guard ─────────────────────────────────────────────
+        if (MarketCalendar.IsHoliday(now))
+        {
+            _logger.LogInformation("ElonMoney: {Date} is a market holiday — nothing to do.", now.ToString("yyyy-MM-dd"));
+            return;
+        }
+
         // ── Time window — 9:45 to 15:55 ET ───────────────────────────────────
         var sessionOpen  = now.Date.AddHours(9).AddMinutes(45);
         var sessionClose = now.Date.AddHours(15).AddMinutes(55);

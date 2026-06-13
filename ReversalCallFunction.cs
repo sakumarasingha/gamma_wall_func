@@ -95,6 +95,13 @@ public class ReversalCallFunction
             return;
         }
 
+        // ── Market holiday guard ─────────────────────────────────────────────
+        if (MarketCalendar.IsHoliday(now))
+        {
+            _logger.LogInformation("ReversalCall: {Date} is a market holiday — nothing to do.", now.ToString("yyyy-MM-dd"));
+            return;
+        }
+
         // ── Time window — 9:45 to 15:55 ET ───────────────────────────────────
         var sessionOpen  = now.Date.AddHours(9).AddMinutes(45);
         var sessionClose = now.Date.AddHours(15).AddMinutes(55);
@@ -145,6 +152,9 @@ public class ReversalCallFunction
         var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ET);
 
         if (now.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
+            return;
+
+        if (MarketCalendar.IsHoliday(now))
             return;
 
         var sessionOpen  = now.Date.AddHours(9).AddMinutes(45);
