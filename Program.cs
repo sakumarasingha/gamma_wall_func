@@ -29,6 +29,11 @@ var host = new HostBuilder()
         services.AddSingleton<IAlpacaTradingClient>(_ => env.GetAlpacaTradingClient(secretKey));
         services.AddSingleton<IAlpacaDataClient>(_ => env.GetAlpacaDataClient(secretKey));
         services.AddSingleton<IAlpacaOptionsDataClient>(_ => env.GetAlpacaOptionsDataClient(secretKey));
+
+        // Persists ReversalCallFunction's open-position state (entry premium,
+        // peak premium, trailing-stop arm flag) to Azure Table Storage so it
+        // survives host restarts / cold starts.
+        services.AddSingleton<ReversalPositionStore>();
     })
     .ConfigureLogging(logging =>
     {
