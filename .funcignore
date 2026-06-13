@@ -1,0 +1,18 @@
+# .NET build output — publish uses bin/publish, not bin/Debug
+obj/
+bin/Debug/
+bin/Release/
+
+# Local dev / secrets
+local.settings.json
+*.user
+.vs/
+
+# Source control
+.git/
+.gitignore
+
+# Azurite / storage emulator
+azurite-data/
+azurite-debug.log
+__azurite_db_*.json

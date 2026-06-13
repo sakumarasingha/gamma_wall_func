@@ -1,0 +1,27 @@
+/.claude
+/__azurite_db_blob__.json
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.nupkg
+*.snupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Azure Functions
+local.settings.json
+.python_packages/
+__azurite_db_*.json
+azurite-data/
+azurite-debug.log
+
+# Test results
+TestResults/
+coverage/
+*.coveragexml
+*.trx
