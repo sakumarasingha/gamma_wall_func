@@ -56,12 +56,18 @@ public class ReversalCallFunction
     private const decimal TrailingStepPct     = 0.05m;  // once armed, close if premium pulls back 5% from its peak
     private const int     BarsLookback        = 10;     // calendar days of 15-min bars to fetch
 
+    // EOD force-close — if a position is still open at/after this time, close
+    // it at market regardless of strategy exit signal (avoids overnight gap /
+    // assignment risk). 5 minutes before the 15:55 session close.
+    private static readonly TimeSpan EodForceCloseTimeOfDay = new(15, 50, 0);
+
     private readonly IAlpacaTradingClient            _tradingClient;
     private readonly IAlpacaDataClient               _dataClient;
     private readonly IAlpacaOptionsDataClient        _optionsDataClient;
     private readonly IConfiguration                  _config;
     private readonly ILogger<ReversalCallFunction>   _logger;
     private readonly ReversalPositionStore           _positionStore;
+    private readonly RiskState                       _riskState;
 
     public ReversalCallFunction(
         IAlpacaTradingClient tradingClient,
@@ -69,7 +75,8 @@ public class ReversalCallFunction
         IAlpacaOptionsDataClient optionsDataClient,
         IConfiguration config,
         ILogger<ReversalCallFunction> logger,
-        ReversalPositionStore positionStore)
+        ReversalPositionStore positionStore,
+        RiskState riskState)
     {
         _tradingClient     = tradingClient;
         _dataClient        = dataClient;
@@ -77,6 +84,7 @@ public class ReversalCallFunction
         _config            = config;
         _logger            = logger;
         _positionStore     = positionStore;
+        _riskState         = riskState;
     }
 
     // ── Entry point — every 5 min, offset 30s past the minute ────────────────
@@ -210,6 +218,17 @@ public class ReversalCallFunction
             return;
         }
 
+        // ── Risk circuit breaker — skip new entries if halted for the day ────
+        var today = DateOnly.FromDateTime(now);
+        if (await _riskState.IsHaltedAsync(today))
+        {
+            string haltReason = await _riskState.GetHaltReasonAsync(today);
+            _logger.LogWarning(
+                "ReversalCall [{Ticker}]: SKIP entry — risk circuit breaker halted for today: {Reason}.",
+                ticker, haltReason);
+            return;
+        }
+
         decimal price = result.CandleClose;
         _logger.LogInformation(
             "ReversalCall [{Ticker}]: ★ ENTRY SIGNAL — bullish reversal confirmed ({Description})  price=${Price:F2}.",
@@ -225,6 +244,19 @@ public class ReversalCallFunction
         var pos = await _positionStore.TryGetAsync(ticker);
         if (pos is null)
             return;
+
+        // ── EOD force-close — close at market regardless of premium levels,
+        // to avoid overnight gap / assignment risk. ──────────────────────────
+        if (now.TimeOfDay >= EodForceCloseTimeOfDay)
+        {
+            var eodQuote = await GetOptionQuoteAsync(pos.OptionSymbol, ticker);
+            decimal eodExitPremium = eodQuote?.Bid ?? pos.EntryPremium;
+            _logger.LogInformation(
+                "ReversalCall [{Ticker}]: EOD FORCE CLOSE — {Time} ET ≥ {Eod} cutoff. Closing call.",
+                ticker, now.ToString("HH:mm"), EodForceCloseTimeOfDay);
+            await ClosePositionAsync(ticker, pos, now, "EOD FORCE CLOSE", eodExitPremium);
+            return;
+        }
 
         var quote = await GetOptionQuoteAsync(pos.OptionSymbol, ticker);
         if (quote is null)
@@ -354,6 +386,8 @@ public class ReversalCallFunction
         _logger.LogInformation(
             "ReversalCall [{Ticker}]: account — tradable cash={Cash:C}  buying power={BP:C}.",
             ticker, cash, account.BuyingPower ?? 0m);
+
+        await _riskState.EnsureDailyStartCashAsync(DateOnly.FromDateTime(now), cash);
 
         if (cash <= 0m)
         {
@@ -628,6 +662,10 @@ public class ReversalCallFunction
 
             await SendAlertAsync(ticker, pos.OptionSymbol, pos.EntryUnderlying, reason, now, isEntry: false,
                 entryPremium: pos.EntryPremium, exitPremium: exitPremium);
+
+            decimal pnlDollars  = (exitPremium - pos.EntryPremium) * 100m;
+            bool    openedToday = pos.EntryTime.Date == now.Date;
+            await _riskState.RecordTradeClosedAsync(DateOnly.FromDateTime(now), pnlDollars, openedToday, "ReversalCall");
 
             await _positionStore.CloseAsync(ticker);
         }

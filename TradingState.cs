@@ -3,17 +3,18 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using Microsoft.Extensions.Logging;
 
+/// <summary>
+/// In-memory VOLD-history tracker for ElonMoneyFunction. Open-position state
+/// now lives in ElonMoneyPositionStore (Azure Table Storage) — see that class
+/// for OptionSymbol / EntryPremium / EntryUnderlying / EntryTime.
+///
+/// VOLD history is intentionally kept in-memory only: it resets every trading
+/// day anyway, and if a cold start loses a few minutes of history, the
+/// "3 rising/falling in a row" checks simply take a few extra ticks to
+/// re-establish — low impact, not worth persisting.
+/// </summary>
 internal static class TradingState
 {
-    // Open call positions (underlying ticker → option symbol)
-    internal static readonly ConcurrentDictionary<string, string>  OpenOptions     = new();
-    // Underlying price at time of entry (for P&L reporting)
-    internal static readonly ConcurrentDictionary<string, decimal> EntryPrices     = new();
-    // Option premium (ask) at time of entry
-    internal static readonly ConcurrentDictionary<string, decimal> EntryPremiums   = new();
-    // Entry timestamp (for reference / cooldown logic)
-    internal static readonly ConcurrentDictionary<string, DateTime> EntryTimes     = new();
-
     // Rolling VOLD history per ticker — used to detect 3 consecutive rises (entry)
     // or 3 consecutive falls (exit). Oldest → newest, capped at 4 readings.
     private static readonly ConcurrentDictionary<string, List<double>> _voldHistory = new();
@@ -26,13 +27,9 @@ internal static class TradingState
         lock (_dateLock)
         {
             if (_lastTradingDate == today) return;
-            logger.LogInformation("TradingState: new trading day {Date} — resetting daily state.", today);
+            logger.LogInformation("TradingState: new trading day {Date} — resetting VOLD history.", today);
             _lastTradingDate = today;
             _voldHistory.Clear();
-            // Note: OpenOptions / EntryPrices / EntryPremiums / EntryTimes are
-            // intentionally NOT cleared on day rollover — an open position
-            // should keep being monitored for exit across the day boundary
-            // (e.g. if it's still open near the close).
         }
     }
 
@@ -75,13 +72,5 @@ internal static class TradingState
         if (history.Count < 3) return false;
         int n = history.Count;
         return history[n - 3] > history[n - 2] && history[n - 2] > history[n - 1];
-    }
-
-    internal static void ClearPosition(string ticker)
-    {
-        OpenOptions.TryRemove(ticker, out _);
-        EntryPrices.TryRemove(ticker, out _);
-        EntryPremiums.TryRemove(ticker, out _);
-        EntryTimes.TryRemove(ticker, out _);
     }
 }

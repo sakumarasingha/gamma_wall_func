@@ -41,25 +41,37 @@ public class ElonMoneyFunction
     private const double  VoldThreshold        = 1.0;    // VOLD ratio must be above this to consider entry
     private const decimal MaxSpreadPct         = 0.15m;  // liquidity gate: (ask-bid)/ask must be < 15%
     private const decimal MaxRiskPct           = 0.50m;  // max contract cost as a fraction of tradable cash (50%)
+    private const decimal StopLossPct          = 0.50m;  // close if premium falls 50% from entry, regardless of VOLD
+
+    // EOD force-close — if a position is still open at/after this time, close
+    // it at market regardless of strategy exit signal (avoids overnight gap /
+    // assignment risk). 5 minutes before the 15:55 session close.
+    private static readonly TimeSpan EodForceCloseTimeOfDay = new(15, 50, 0);
 
     private readonly IAlpacaTradingClient            _tradingClient;
     private readonly IAlpacaDataClient               _dataClient;
     private readonly IAlpacaOptionsDataClient        _optionsDataClient;
     private readonly IConfiguration                  _config;
     private readonly ILogger<ElonMoneyFunction>      _logger;
+    private readonly ElonMoneyPositionStore          _positionStore;
+    private readonly RiskState                       _riskState;
 
     public ElonMoneyFunction(
         IAlpacaTradingClient tradingClient,
         IAlpacaDataClient dataClient,
         IAlpacaOptionsDataClient optionsDataClient,
         IConfiguration config,
-        ILogger<ElonMoneyFunction> logger)
+        ILogger<ElonMoneyFunction> logger,
+        ElonMoneyPositionStore positionStore,
+        RiskState riskState)
     {
         _tradingClient     = tradingClient;
         _dataClient        = dataClient;
         _optionsDataClient = optionsDataClient;
         _config            = config;
         _logger            = logger;
+        _positionStore     = positionStore;
+        _riskState         = riskState;
     }
 
     // ── Entry point — every 1 min ─────────────────────────────────────────────
@@ -124,6 +136,44 @@ public class ElonMoneyFunction
         string ticker, DateTime now, DateTime dayStartUtc, DateTime nowUtc,
         double voldThreshold, decimal maxSpreadPct, decimal maxRiskPct)
     {
+        var pos = await _positionStore.TryGetAsync(ticker);
+
+        // ── EOD force-close — if a position is open at/after 15:50 ET, close
+        // it at market regardless of the VOLD signal (avoids overnight gap /
+        // assignment risk). ─────────────────────────────────────────────────
+        if (pos is not null && now.TimeOfDay >= EodForceCloseTimeOfDay)
+        {
+            var eodQuote = await GetOptionQuoteAsync(pos.OptionSymbol, ticker);
+            decimal eodExitPremium = eodQuote?.Bid ?? pos.EntryPremium;
+            _logger.LogInformation(
+                "ElonMoney [{Ticker}]: EOD FORCE CLOSE — {Time} ET ≥ {Eod} cutoff. Closing call.",
+                ticker, now.ToString("HH:mm"), EodForceCloseTimeOfDay);
+            await ClosePositionAsync(ticker, pos, now, "EOD FORCE CLOSE", eodExitPremium);
+            return;
+        }
+
+        // ── Premium-based stop loss — checked every tick regardless of bar
+        // availability, since it depends only on the live option quote. ─────
+        if (pos is not null)
+        {
+            var quote = await GetOptionQuoteAsync(pos.OptionSymbol, ticker);
+            if (quote is not null && quote.Value.Bid > 0m)
+            {
+                decimal currentPremium = quote.Value.Bid;
+                decimal pnlPct = (currentPremium - pos.EntryPremium) / pos.EntryPremium;
+
+                if (pnlPct <= -StopLossPct)
+                {
+                    _logger.LogInformation(
+                        "ElonMoney [{Ticker}]: EXIT — STOP LOSS. premium ${Current:F2} is {Pnl:P1} vs entry ${Entry:F2} " +
+                        "(≤ -{Stop:P0}). Closing call.",
+                        ticker, currentPremium, pnlPct, pos.EntryPremium, StopLossPct);
+                    await ClosePositionAsync(ticker, pos, now, $"STOP LOSS (-{StopLossPct:P0} premium)", currentPremium);
+                    return;
+                }
+            }
+        }
+
         // ── Fetch today's 1-min bars so far ──────────────────────────────────
         var bars = await FetchBarsAsync(ticker, dayStartUtc, nowUtc);
         if (bars.Count < RollingWindowBars)
@@ -147,17 +197,17 @@ public class ElonMoneyFunction
             "ElonMoney [{Ticker}]: VOLD={Ratio}  (rolling {Window}-bar, {Bars} bars today)  history=[{History}]  signal={Signal}.",
             ticker, ratioStr, RollingWindowBars, bars.Count, historyStr, vold.Signal);
 
-        bool hasOpenPosition = TradingState.OpenOptions.ContainsKey(ticker);
-
         // ── EXIT — 3 consecutive falling VOLD readings ───────────────────────
-        if (hasOpenPosition)
+        if (pos is not null)
         {
             if (TradingState.IsVoldFallingThreeInARow(ticker))
             {
                 _logger.LogInformation(
                     "ElonMoney [{Ticker}]: EXIT — VOLD falling 3 ticks in a row [{History}]. Closing call.",
                     ticker, historyStr);
-                await ClosePositionAsync(ticker, now);
+                var quote = await GetOptionQuoteAsync(pos.OptionSymbol, ticker);
+                decimal exitPremium = quote?.Bid ?? pos.EntryPremium;
+                await ClosePositionAsync(ticker, pos, now, "VOLD FALLING 3x", exitPremium);
             }
             else
             {
@@ -189,6 +239,17 @@ public class ElonMoneyFunction
             _logger.LogInformation(
                 "ElonMoney [{Ticker}]: SKIP — VOLD rising 3x but bar volume not also rising 3x in a row [{Volumes}].",
                 ticker, volumeStr);
+            return;
+        }
+
+        // ── Risk circuit breaker — skip new entries if halted for the day ────
+        var today = DateOnly.FromDateTime(now);
+        if (await _riskState.IsHaltedAsync(today))
+        {
+            string haltReason = await _riskState.GetHaltReasonAsync(today);
+            _logger.LogWarning(
+                "ElonMoney [{Ticker}]: SKIP entry — risk circuit breaker halted for today: {Reason}.",
+                ticker, haltReason);
             return;
         }
 
@@ -252,6 +313,8 @@ public class ElonMoneyFunction
         _logger.LogInformation(
             "ElonMoney [{Ticker}]: account — tradable cash={Cash:C}  buying power={BP:C}.",
             ticker, cash, account.BuyingPower ?? 0m);
+
+        await _riskState.EnsureDailyStartCashAsync(DateOnly.FromDateTime(now), cash);
 
         if (cash <= 0m)
         {
@@ -471,6 +534,28 @@ public class ElonMoneyFunction
         return v1 < v2 && v2 < v3;
     }
 
+    // ── Latest option quote (for exit checks) ────────────────────────────────
+
+    private async Task<(decimal Bid, decimal Ask)?> GetOptionQuoteAsync(string optionSymbol, string ticker)
+    {
+        try
+        {
+            var req    = new LatestOptionsDataRequest(new[] { optionSymbol });
+            var quotes = await _optionsDataClient.ListLatestQuotesAsync(req);
+            if (quotes.TryGetValue(optionSymbol, out var q))
+                return (q.BidPrice, q.AskPrice);
+
+            _logger.LogWarning(
+                "ElonMoney [{Ticker}]: no latest quote returned for {Symbol}.", ticker, optionSymbol);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "ElonMoney [{Ticker}]: failed to fetch latest quote for {Symbol}.", ticker, optionSymbol);
+            return null;
+        }
+    }
+
     // ── Order helpers ─────────────────────────────────────────────────────────
 
     private async Task PlaceCallBuyOrderAsync(
@@ -488,17 +573,14 @@ public class ElonMoneyFunction
             _logger.LogInformation(
                 "ElonMoney [{Ticker}]: ✔ BUY order accepted — orderId={OrderId}  symbol={Symbol}  status={Status}  " +
                 "underlying={Price:F2}  premium(ask)={Premium:F2}  " +
-                "exit on 3 consecutive falling VOLD readings.",
-                ticker, order.OrderId, optionSymbol, order.OrderStatus, currentPrice, premium);
+                "exit on -{Stop:P0} stop loss, EOD force-close, or 3 consecutive falling VOLD readings.",
+                ticker, order.OrderId, optionSymbol, order.OrderStatus, currentPrice, premium, StopLossPct);
 
-            TradingState.OpenOptions[ticker]   = optionSymbol;
-            TradingState.EntryPrices[ticker]   = currentPrice;
-            TradingState.EntryPremiums[ticker] = premium;
-            TradingState.EntryTimes[ticker]    = now;
+            await _positionStore.OpenAsync(ticker, optionSymbol, premium, currentPrice, now);
 
             decimal? strike = ParseStrikeFromSymbol(optionSymbol);
 
-            await SendAlertAsync(ticker, optionSymbol, currentPrice, currentPrice, "ENTRY", now, isEntry: true,
+            await SendAlertAsync(ticker, optionSymbol, currentPrice, "ENTRY", now, isEntry: true,
                 strike: strike, premium: premium);
         }
         catch (Exception ex)
@@ -507,46 +589,47 @@ public class ElonMoneyFunction
         }
     }
 
-    private async Task ClosePositionAsync(string ticker, DateTime now)
+    private async Task ClosePositionAsync(
+        string ticker, ElonMoneyPositionStore.Position pos, DateTime now, string reason, decimal exitPremium)
     {
-        if (!TradingState.OpenOptions.TryGetValue(ticker, out var optionSymbol))
-        {
-            _logger.LogWarning("ElonMoney [{Ticker}]: no open option symbol on record — cannot close.", ticker);
-            return;
-        }
-
         try
         {
             _logger.LogInformation(
-                "ElonMoney [{Ticker}]: placing SELL order — symbol={Symbol}  reason=VOLD FALLING 3x.",
-                ticker, optionSymbol);
+                "ElonMoney [{Ticker}]: placing SELL order — symbol={Symbol}  reason={Reason}.",
+                ticker, pos.OptionSymbol, reason);
 
-            var req   = new NewOrderRequest(optionSymbol, 1, OrderSide.Sell, OrderType.Market, TimeInForce.Day);
+            var req   = new NewOrderRequest(pos.OptionSymbol, 1, OrderSide.Sell, OrderType.Market, TimeInForce.Day);
             var order = await _tradingClient.PostOrderAsync(req);
 
-            TradingState.EntryPrices.TryGetValue(ticker, out decimal entryPrice);
-
             _logger.LogInformation(
-                "ElonMoney [{Ticker}]: ✔ close order accepted — orderId={OrderId}  status={Status}.",
-                ticker, order.OrderId, order.OrderStatus);
+                "ElonMoney [{Ticker}]: ✔ close order accepted — orderId={OrderId}  status={Status}  " +
+                "entryPremium=${Entry:F2}  exitPremium=${Exit:F2}.",
+                ticker, order.OrderId, order.OrderStatus, pos.EntryPremium, exitPremium);
 
-            await SendAlertAsync(ticker, optionSymbol, entryPrice, entryPrice, "VOLD FALLING 3x", now, isEntry: false);
+            await SendAlertAsync(ticker, pos.OptionSymbol, pos.EntryUnderlying, reason, now, isEntry: false,
+                entryPremium: pos.EntryPremium, exitPremium: exitPremium);
 
-            TradingState.ClearPosition(ticker);
+            decimal pnlDollars  = (exitPremium - pos.EntryPremium) * 100m;
+            bool    openedToday = pos.EntryTime.Date == now.Date;
+            await _riskState.RecordTradeClosedAsync(DateOnly.FromDateTime(now), pnlDollars, openedToday, "ElonMoney");
+
+            await _positionStore.CloseAsync(ticker);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex,
                 "ElonMoney [{Ticker}]: ✘ FAILED to close position {Symbol} — position may still be open!",
-                ticker, optionSymbol);
+                ticker, pos.OptionSymbol);
         }
     }
 
     // ── Email alerts ──────────────────────────────────────────────────────────
 
     private async Task SendAlertAsync(
-        string ticker, string optionSymbol, decimal price, decimal entryPrice,
-        string reason, DateTime now, bool isEntry, decimal? strike = null, decimal? premium = null)
+        string ticker, string optionSymbol, decimal underlyingPrice,
+        string reason, DateTime now, bool isEntry,
+        decimal? strike = null, decimal? premium = null,
+        decimal? entryPremium = null, decimal? exitPremium = null)
     {
         string sender     = Environment.GetEnvironmentVariable("GMAIL_SENDER")     ?? "";
         string password   = Environment.GetEnvironmentVariable("GMAIL_PASSWORD")   ?? "";
@@ -561,7 +644,11 @@ public class ElonMoneyFunction
         }
 
         string action = isEntry ? "Call Entry (VOLD Momentum)" : $"Call Closed — {reason}";
-        string color  = "#1a7a1a";
+        string color  = isEntry ? "#1a7a1a" : (reason.StartsWith("STOP") || reason.StartsWith("EOD") ? "#c0392b" : "#1a7a1a");
+
+        decimal? pnlPct = (!isEntry && entryPremium.HasValue && exitPremium.HasValue && entryPremium.Value != 0m)
+            ? (exitPremium.Value - entryPremium.Value) / entryPremium.Value
+            : null;
 
         string body = $"""
             <html><body style="font-family:Arial,sans-serif;background:#f5f5f5;padding:20px">
@@ -574,26 +661,31 @@ public class ElonMoneyFunction
               <tr><td style="padding:8px 16px;color:#555">Option Symbol</td>
                   <td style="padding:8px 16px;font-weight:bold;font-family:monospace">{optionSymbol}</td></tr>
               <tr style="background:#f9f9f9"><td style="padding:8px 16px;color:#555">{ticker} Price</td>
-                  <td style="padding:8px 16px;font-weight:bold">${price:F2}</td></tr>
+                  <td style="padding:8px 16px;font-weight:bold">${underlyingPrice:F2}</td></tr>
               {(isEntry
                 ? $"""
                   <tr><td style="padding:8px 16px;color:#555">Strike</td>
                       <td style="padding:8px 16px;font-weight:bold">{(strike.HasValue ? $"${strike.Value:F2}" : "n/a")}</td></tr>
                   <tr style="background:#f9f9f9"><td style="padding:8px 16px;color:#555">Premium (Ask)</td>
                       <td style="padding:8px 16px;font-weight:bold">{(premium.HasValue ? $"${premium.Value:F2}" : "n/a")}  (cost: {(premium.HasValue ? $"${premium.Value * 100m:F2}" : "n/a")})</td></tr>
-                  <tr><td style="padding:8px 16px;color:#555">Exit Condition</td>
+                  <tr><td style="padding:8px 16px;color:#555">Exit Plan</td>
                       <td style="padding:8px 16px;color:#c0392b;font-weight:bold">
-                        Close when VOLD ratio falls 3 consecutive minutes in a row
+                        Stop loss at -{StopLossPct:P0} premium · VOLD falling 3 ticks in a row · EOD force-close at {EodForceCloseTimeOfDay}
                       </td></tr>
                   """
                 : $"""
                   <tr><td style="padding:8px 16px;color:#555">Close Reason</td>
                       <td style="padding:8px 16px;font-weight:bold">{reason}</td></tr>
+                  <tr style="background:#f9f9f9"><td style="padding:8px 16px;color:#555">Entry → Exit Premium</td>
+                      <td style="padding:8px 16px;font-weight:bold">
+                        {(entryPremium.HasValue ? $"${entryPremium.Value:F2}" : "n/a")} → {(exitPremium.HasValue ? $"${exitPremium.Value:F2}" : "n/a")}
+                        {(pnlPct.HasValue ? $" ({pnlPct.Value:P1})" : "")}
+                      </td></tr>
                   """)}
             </table>
             <p style="color:#888;font-size:12px;margin-top:16px">
-              Qty: 1 contract · Entry: Market · Exit: Market · Day · " +
-              Scan: every 1 min, 9:30–15:55 ET · VOLD threshold &gt; {VoldThreshold} with 3 rising ticks ·
+              Qty: 1 contract · Entry: Market · Exit: Market · Day ·
+              Scan: every 1 min, 9:45–15:55 ET · VOLD threshold &gt; {VoldThreshold} with 3 rising ticks ·
               Risk cap: {MaxRiskPct:P0} of cash · Max spread: {MaxSpreadPct:P0}
             </p>
             </body></html>
