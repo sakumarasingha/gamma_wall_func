@@ -6,8 +6,8 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
-/// Account-wide, cross-strategy daily risk circuit breaker shared by
-/// ElonMoneyFunction and ReversalCallFunction. Backed by Azure Table Storage
+/// Account-wide daily risk circuit breaker used by ReversalCallFunction
+/// (and any future strategies). Backed by Azure Table Storage
 /// (single row, "RiskState"/"Daily") so the day's counters survive host
 /// restarts.
 ///
@@ -25,7 +25,7 @@ using Microsoft.Extensions.Logging;
 ///                          daily-loss-% breaker).
 ///
 /// If any threshold is breached, Halted=true for the rest of the day and
-/// BOTH functions skip new entries (exits / EOD force-closes still run).
+/// new entries are skipped (exits / EOD force-closes still run).
 /// </summary>
 public sealed class RiskState
 {

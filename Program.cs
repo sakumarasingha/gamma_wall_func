@@ -35,9 +35,6 @@ var host = new HostBuilder()
         // survives host restarts / cold starts.
         services.AddSingleton<ReversalPositionStore>();
 
-        // Persists ElonMoneyFunction's open-position state the same way.
-        services.AddSingleton<ElonMoneyPositionStore>();
-
         // Cross-strategy daily risk circuit breaker (day-trade count,
         // consecutive losses, daily loss %).
         services.AddSingleton<RiskState>();
