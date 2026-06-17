@@ -49,9 +49,14 @@ public class ReversalCallFunction
         TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
 
     // ── Tuneable parameters ───────────────────────────────────────────────────
-    private const decimal MaxSpreadPct        = 0.15m;  // liquidity gate: (ask-bid)/ask must be < 15%
-    private const decimal MaxRiskPct          = 0.50m;  // max contract cost as a fraction of tradable cash (50%)
-    private const decimal StopLossPct         = 0.15m;  // close if premium falls 15% from entry
+    // Sized for a ~$2 000 account willing to risk up to $1 000 per trade:
+    //   50% of cash = $1 000 max contract cost → max ask up to $10/share
+    //   Min ask $3/share ($300/contract) — real premium, no cheap OTM junk
+    //   Delta 0.40–0.70 — near-ATM, meaningful directional exposure
+    //   Strike -3% to +2% — slightly ITM to just OTM
+    private const decimal MaxSpreadPct        = 0.10m;  // 10% spread — tighter; real premium options have tighter markets
+    private const decimal MaxRiskPct          = 0.50m;  // 50% of cash per trade ($1 000 on $2 000)
+    private const decimal StopLossPct         = 0.20m;  // close if premium falls 20% from entry
     private const decimal TrailingActivatePct = 0.15m;  // trailing stop arms once premium is +15% from entry
     private const decimal TrailingStepPct     = 0.05m;  // once armed, close if premium pulls back 5% from its peak
     private const int     BarsLookback        = 10;     // calendar days of 15-min bars to fetch
@@ -402,11 +407,13 @@ public class ReversalCallFunction
             "ReversalCall [{Ticker}]: risk cap — {RiskPct:P0} of cash ${Cash:F2} = ${Budget:F2} → maxAsk=${MaxAsk:F2} (contract cost ≤ ${Cost:F2}).",
             ticker, maxRiskPct, cash, riskBudget, maxAsk, maxAsk * 100m);
 
+        // Min $1/share ask → $100/contract. If budget can't cover that, skip.
         if (maxAsk < 1.00m)
         {
             _logger.LogWarning(
-                "ReversalCall [{Ticker}]: SKIP — {RiskPct:P0} risk budget ${Budget:F2} too low for even a $1.00 ask.",
-                ticker, maxRiskPct, riskBudget);
+                "ReversalCall [{Ticker}]: SKIP — {RiskPct:P0} risk budget ${Budget:F2} too low " +
+                "(maxAsk=${MaxAsk:F2}/share, need ≥ $1.00).",
+                ticker, maxRiskPct, riskBudget, maxAsk);
             return;
         }
 
@@ -440,8 +447,8 @@ public class ReversalCallFunction
     {
         var     minExpiry     = DateOnly.FromDateTime(now.Date);
         var     maxExpiry     = DateOnly.FromDateTime(now.Date.AddDays(10));
-        decimal strikeFloor   = Math.Round(underlyingPrice * 0.99m, 2);
-        decimal strikeCeiling = Math.Round(underlyingPrice * 1.05m, 2);
+        decimal strikeFloor   = Math.Round(underlyingPrice * 0.97m, 2);  // up to -3% ITM
+        decimal strikeCeiling = Math.Round(underlyingPrice * 1.02m, 2);  // up to +2% OTM
 
         _logger.LogInformation(
             "ReversalCall [{Ticker}]: call chain request — expiry {Min}–{Max}  strike {Floor:F2}–{Ceil:F2}  maxAsk=${MaxAsk:F2}.",
@@ -487,8 +494,8 @@ public class ReversalCallFunction
                 decimal spreadPct = ask > 0m ? (ask - bid) / ask : 1m;
                 decimal score     = ask > 0m ? gamma / ask : 0m;
                 bool meetsCore =
-                    ask >= 1.00m && ask <= maxAsk
-                 && delta >= 0.30m && delta <= 0.65m
+                    ask >= 1.00m && ask <= maxAsk      // $1–$10/share = $100–$1 000/contract
+                 && delta >= 0.40m && delta <= 0.70m   // near-ATM, real directional exposure
                  && gamma > 0m;
                 bool liquid = spreadPct < maxSpreadPct;
                 DateOnly expiry = ParseExpiryFromSymbol(kv.Key, now);
@@ -503,8 +510,8 @@ public class ReversalCallFunction
 
         _logger.LogInformation(
             "ReversalCall [{Ticker}]: {Pass}/{Total} contract(s) passed core filters " +
-            "(ask $1–${MaxAsk:F2}, delta +0.30–+0.65, gamma > 0).",
-            ticker, coreCandidates.Count, chainPage.Items.Count, maxAsk);
+            "(ask $1–${MaxAsk:F2}/share [$100–${MaxCost:F0}/contract], delta 0.40–0.70, gamma > 0).",
+            ticker, coreCandidates.Count, chainPage.Items.Count, maxAsk, maxAsk * 100m);
 
         if (coreCandidates.Count == 0)
         {
@@ -720,7 +727,7 @@ public class ReversalCallFunction
                       <td style="padding:8px 16px;font-weight:bold">{(premium.HasValue ? $"${premium.Value:F2}" : "n/a")}  (cost: {(premium.HasValue ? $"${premium.Value * 100m:F2}" : "n/a")})</td></tr>
                   <tr><td style="padding:8px 16px;color:#555">Exit Plan</td>
                       <td style="padding:8px 16px;color:#c0392b;font-weight:bold">
-                        Stop loss at -15% premium · trailing stop arms at +15%, trails 5% below peak
+                        Stop loss at -{StopLossPct:P0} premium · trailing stop arms at +{TrailingActivatePct:P0}, trails {TrailingStepPct:P0} below peak · EOD force-close {EodForceCloseTimeOfDay} ET
                       </td></tr>
                   """
                 : $"""

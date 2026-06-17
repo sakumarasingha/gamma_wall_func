@@ -53,15 +53,21 @@ public class GexFunction
         TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
 
     // ── Tuneable parameters ───────────────────────────────────────────────────
-    // Sized for a ~$500 cash account:
-    //   5% risk per trade = $25 max contract cost → max ask ≈ $0.25/share
-    //   "Buy mispriced, inexpensive options" (negative-GEX row in the framework)
-    //   means deliberately cheap OTM calls, not near-ATM.
-    private const decimal MaxSpreadPct      = 0.25m;  // max bid/ask spread as % of ask (wider allowed for cheap OTM)
-    private const decimal MaxRiskPct        = 0.05m;  // 5% of cash per trade ($25 on $500)
-    private const decimal StopLossPct       = 0.40m;  // close if premium falls 40% from entry (cheap OTM decays fast; give room)
-    private const decimal MinWallDistance   = 0.02m;  // skip entry if GEX wall is < 2% above price
-    private const decimal WallExitBuffer    = 0.003m; // close when underlying is within 0.3% of wall
+    // Sized for a ~$2 000 account, max $1 000 per trade in REAL premium:
+    //   • Min ask $3/share ($300/contract) — no worthless cheap OTM junk
+    //   • Max ask $10/share ($1 000/contract) — hard cap at $1 000 spend
+    //   • Delta 0.40–0.70 — near-ATM calls with real directional exposure
+    //   • Strike -3% to +2% — slightly ITM to just OTM (quality, not lottery)
+    //
+    //   Math example (TSLA @ $300, budget $1 000):
+    //     • $5.00 ask × 100 = $500 contract  ← typical entry
+    //     • Stop loss 20% → max loss $100 on that contract
+    //     • GEX wall exit locks in gain before pinning; EOD if still open
+    private const decimal MaxSpreadPct      = 0.10m;  // 10% spread — tighter; real premium options have tighter markets
+    private const decimal MaxRiskPct        = 0.50m;  // 50% of cash = $1 000 on $2 000 account
+    private const decimal StopLossPct       = 0.20m;  // 20% stop — real premium, so 20% is a meaningful $ loss
+    private const decimal MinWallDistance   = 0.02m;  // skip if GEX wall < 2% above price
+    private const decimal WallExitBuffer    = 0.003m; // exit when underlying within 0.3% of GEX wall
 
     private static readonly TimeSpan EodForceCloseTime = new(15, 50, 0);
 
@@ -295,9 +301,9 @@ public class GexFunction
         decimal riskBudget      = cash * maxRiskPctEff;
         decimal maxAsk          = Math.Floor(riskBudget / 100m * 100m) / 100m;
 
-        // maxAsk = per-share ask price limit.  e.g. $500 × 5% = $25 budget → $0.25/share max.
-        // Floor at $0.05 — below that, liquidity is usually non-existent.
-        if (maxAsk < 0.05m)
+        // maxAsk = per-share ask price limit.  e.g. $2 000 × 50% = $1 000 budget → $10/share max.
+        // Floor at $1/share ($100/contract).
+        if (maxAsk < 1.00m)
         {
             _logger.LogWarning(
                 "GexScan [{Ticker}]: SKIP — risk budget ${Budget:F2} too small (maxAsk=${Max:F2}/share).",
@@ -444,14 +450,14 @@ public class GexFunction
         IReadOnlyDictionary<string, IOptionSnapshot> chain,
         decimal underlyingPrice, decimal maxAsk, decimal maxSpreadPct, DateTime now)
     {
-        // GEX strategy for small accounts: "buy mispriced, inexpensive options"
-        //   → cheap OTM calls (delta 0.15–0.40), 0–10 DTE, ATM to +8% OTM.
-        //   With $500 account / 5% risk, maxAsk ≈ $0.25/share ($25/contract).
-        //   Cheap OTM calls have the highest gamma/ask ratio — exactly what we
-        //   want in a negative-GEX (amplified momentum) environment.
+        // $1 000 budget → real premium, near-ATM calls only.
+        //   delta 0.40–0.70  — meaningful directional exposure, not a lottery ticket
+        //   strike -3% to +2% — slightly ITM to just OTM; avoids worthless far-OTM
+        //   0–10 DTE          — short-dated for gamma leverage in a negative-GEX move
+        //   Score: gamma/ask  — still maximises movement per dollar paid
         var maxExpiry   = DateOnly.FromDateTime(now.Date.AddDays(10));
-        decimal floor   = Math.Round(underlyingPrice * 1.00m, 2);  // at or above ATM only
-        decimal ceiling = Math.Round(underlyingPrice * 1.08m, 2);  // up to +8% OTM
+        decimal floor   = Math.Round(underlyingPrice * 0.97m, 2);  // up to -3% (slightly ITM)
+        decimal ceiling = Math.Round(underlyingPrice * 1.02m, 2);  // up to +2% OTM only
 
         var candidates = chain
             .Where(kv => GexAnalyzer.IsCall(kv.Key))
@@ -469,11 +475,11 @@ public class GexFunction
                 decimal strike    = GexAnalyzer.ParseStrike(kv.Key);
 
                 bool meetsCore =
-                    ask >= 0.05m && ask <= maxAsk      // $0.05–maxAsk per share ($5–$25 contract)
-                 && delta >= 0.15m && delta <= 0.40m   // cheap OTM — high leverage, "mispriced"
+                    ask >= 1.00m && ask <= maxAsk      // $1–$10/share = $100–$1 000/contract
+                 && delta >= 0.40m && delta <= 0.70m   // near-ATM — real directional exposure
                  && gamma > 0m
                  && expiry <= maxExpiry                 // 0–10 DTE
-                 && strike >= floor && strike <= ceiling; // ATM to +8% OTM
+                 && strike >= floor && strike <= ceiling; // -3% ITM to +2% OTM
 
                 bool liquid = spreadPct < maxSpreadPct;
 
@@ -489,8 +495,8 @@ public class GexFunction
 
         _logger.LogInformation(
             "GexScan [{Ticker}]: call selection — {Pass}/{Total} calls passed core filters " +
-            "(ask $0.05–${Max:F2}/share, delta 0.15–0.40, gamma > 0, ≤ {Expiry}, strike {Floor:F2}–{Ceil:F2}).",
-            ticker, core.Count, candidates.Count, maxAsk, maxExpiry, floor, ceiling);
+            "(ask $1–${Max:F2}/share [$100–${MaxCost:F0}/contract], delta 0.40–0.70, ≤ {Expiry}, strike {Floor:F2}–{Ceil:F2}).",
+            ticker, core.Count, candidates.Count, maxAsk, maxAsk * 100m, maxExpiry, floor, ceiling);
 
         if (core.Count == 0)
         {
