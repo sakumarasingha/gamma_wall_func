@@ -30,17 +30,11 @@ var host = new HostBuilder()
         services.AddSingleton<IAlpacaDataClient>(_ => env.GetAlpacaDataClient(secretKey));
         services.AddSingleton<IAlpacaOptionsDataClient>(_ => env.GetAlpacaOptionsDataClient(secretKey));
 
-        // Persists ReversalCallFunction's open-position state (entry premium,
-        // peak premium, trailing-stop arm flag) to Azure Table Storage so it
-        // survives host restarts / cold starts.
+        // In-memory position stores (one singleton per strategy).
+        // State lives for the lifetime of the host process — a restart clears
+        // open positions, so ensure no trades are open before redeploying.
         services.AddSingleton<ReversalPositionStore>();
-
-        // Persists GexFunction's open-position state (entry premium, entry
-        // underlying price, GEX wall above) to Azure Table Storage.
         services.AddSingleton<GexPositionStore>();
-
-        // Persists WallBounceFunction's open-position state (entry premium,
-        // put wall level for wall-break exit) to Azure Table Storage.
         services.AddSingleton<WallBouncePositionStore>();
 
         // Cross-strategy daily risk circuit breaker (day-trade count,
