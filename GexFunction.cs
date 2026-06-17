@@ -53,9 +53,13 @@ public class GexFunction
         TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
 
     // ── Tuneable parameters ───────────────────────────────────────────────────
-    private const decimal MaxSpreadPct      = 0.15m;  // max bid/ask spread as % of ask
-    private const decimal MaxRiskPct        = 0.50m;  // max contract cost as % of tradable cash
-    private const decimal StopLossPct       = 0.20m;  // close if premium falls 20% from entry
+    // Sized for a ~$500 cash account:
+    //   5% risk per trade = $25 max contract cost → max ask ≈ $0.25/share
+    //   "Buy mispriced, inexpensive options" (negative-GEX row in the framework)
+    //   means deliberately cheap OTM calls, not near-ATM.
+    private const decimal MaxSpreadPct      = 0.25m;  // max bid/ask spread as % of ask (wider allowed for cheap OTM)
+    private const decimal MaxRiskPct        = 0.05m;  // 5% of cash per trade ($25 on $500)
+    private const decimal StopLossPct       = 0.40m;  // close if premium falls 40% from entry (cheap OTM decays fast; give room)
     private const decimal MinWallDistance   = 0.02m;  // skip entry if GEX wall is < 2% above price
     private const decimal WallExitBuffer    = 0.003m; // close when underlying is within 0.3% of wall
 
@@ -234,6 +238,32 @@ public class GexFunction
             return;
         }
 
+        // ── Momentum confirmation ─────────────────────────────────────────────
+        // Negative GEX means moves are amplified — but amplified in WHICH direction?
+        // We only want calls when the underlying is actually trending UP.
+        // Require: last completed 1-min bar is green (close > open).
+        // This filters out "falling knife" setups where negative GEX is amplifying
+        // a downmove — exactly when a long call would be destroyed.
+        var momentum = await GetMomentumAsync(ticker);
+        if (momentum is null)
+        {
+            _logger.LogWarning("GexScan [{Ticker}]: SKIP — could not determine momentum direction.", ticker);
+            return;
+        }
+        if (!momentum.Value.IsBullish)
+        {
+            _logger.LogInformation(
+                "GexScan [{Ticker}]: SKIP — last bar is bearish (open=${Open:F2} close=${Close:F2}) " +
+                "— negative GEX may be amplifying downside, not a call setup.",
+                ticker, momentum.Value.Open, momentum.Value.Close);
+            return;
+        }
+        _logger.LogInformation(
+            "GexScan [{Ticker}]: momentum ✔ bullish — last bar open=${Open:F2} close=${Close:F2} " +
+            "(+{Move:P2})  underlying=${Price:F2}.",
+            ticker, momentum.Value.Open, momentum.Value.Close,
+            (momentum.Value.Close - momentum.Value.Open) / momentum.Value.Open, underlyingPrice);
+
         // ── Account / risk gates ─────────────────────────────────────────────
         var positions = await _tradingClient.ListPositionsAsync();
         bool alreadyIn = positions.Any(p =>
@@ -265,9 +295,13 @@ public class GexFunction
         decimal riskBudget      = cash * maxRiskPctEff;
         decimal maxAsk          = Math.Floor(riskBudget / 100m * 100m) / 100m;
 
-        if (maxAsk < 1.00m)
+        // maxAsk = per-share ask price limit.  e.g. $500 × 5% = $25 budget → $0.25/share max.
+        // Floor at $0.05 — below that, liquidity is usually non-existent.
+        if (maxAsk < 0.05m)
         {
-            _logger.LogWarning("GexScan [{Ticker}]: SKIP — risk budget ${Budget:F2} too low.", ticker, riskBudget);
+            _logger.LogWarning(
+                "GexScan [{Ticker}]: SKIP — risk budget ${Budget:F2} too small (maxAsk=${Max:F2}/share).",
+                ticker, riskBudget, maxAsk);
             return;
         }
 
@@ -410,9 +444,14 @@ public class GexFunction
         IReadOnlyDictionary<string, IOptionSnapshot> chain,
         decimal underlyingPrice, decimal maxAsk, decimal maxSpreadPct, DateTime now)
     {
-        var maxExpiry     = DateOnly.FromDateTime(now.Date.AddDays(10));
-        decimal floor     = Math.Round(underlyingPrice * 0.99m, 2);
-        decimal ceiling   = Math.Round(underlyingPrice * 1.05m, 2);
+        // GEX strategy for small accounts: "buy mispriced, inexpensive options"
+        //   → cheap OTM calls (delta 0.15–0.40), 0–10 DTE, ATM to +8% OTM.
+        //   With $500 account / 5% risk, maxAsk ≈ $0.25/share ($25/contract).
+        //   Cheap OTM calls have the highest gamma/ask ratio — exactly what we
+        //   want in a negative-GEX (amplified momentum) environment.
+        var maxExpiry   = DateOnly.FromDateTime(now.Date.AddDays(10));
+        decimal floor   = Math.Round(underlyingPrice * 1.00m, 2);  // at or above ATM only
+        decimal ceiling = Math.Round(underlyingPrice * 1.08m, 2);  // up to +8% OTM
 
         var candidates = chain
             .Where(kv => GexAnalyzer.IsCall(kv.Key))
@@ -423,22 +462,24 @@ public class GexFunction
                 decimal delta     = kv.Value.Greeks?.Delta ?? 0m;
                 decimal gamma     = kv.Value.Greeks?.Gamma ?? 0m;
                 decimal spreadPct = ask > 0m ? (ask - bid) / ask : 1m;
+                // Score: gamma/ask — highest ratio = most leverage per dollar spent
+                // (the defining edge of cheap OTM calls in negative-GEX environments)
                 decimal score     = ask > 0m ? gamma / ask : 0m;
                 DateOnly expiry   = ParseExpiry(kv.Key, now);
                 decimal strike    = GexAnalyzer.ParseStrike(kv.Key);
 
                 bool meetsCore =
-                    ask >= 1.00m && ask <= maxAsk
-                 && delta >= 0.30m && delta <= 0.65m
+                    ask >= 0.05m && ask <= maxAsk      // $0.05–maxAsk per share ($5–$25 contract)
+                 && delta >= 0.15m && delta <= 0.40m   // cheap OTM — high leverage, "mispriced"
                  && gamma > 0m
-                 && expiry <= maxExpiry
-                 && strike >= floor && strike <= ceiling;
+                 && expiry <= maxExpiry                 // 0–10 DTE
+                 && strike >= floor && strike <= ceiling; // ATM to +8% OTM
 
                 bool liquid = spreadPct < maxSpreadPct;
 
                 return (Symbol: kv.Key, Ask: ask, Bid: bid, SpreadPct: spreadPct,
                         Delta: delta, Gamma: gamma, Score: score,
-                        Expiry: expiry, MeetsCore: meetsCore, Liquid: liquid);
+                        Strike: strike, Expiry: expiry, MeetsCore: meetsCore, Liquid: liquid);
             })
             .OrderBy(x => x.Expiry)
             .ThenByDescending(x => x.Score)
@@ -448,12 +489,15 @@ public class GexFunction
 
         _logger.LogInformation(
             "GexScan [{Ticker}]: call selection — {Pass}/{Total} calls passed core filters " +
-            "(ask $1–${Max:F2}, delta 0.30–0.65, gamma > 0, ≤ {Expiry}, strike {Floor:F2}–{Ceil:F2}).",
+            "(ask $0.05–${Max:F2}/share, delta 0.15–0.40, gamma > 0, ≤ {Expiry}, strike {Floor:F2}–{Ceil:F2}).",
             ticker, core.Count, candidates.Count, maxAsk, maxExpiry, floor, ceiling);
 
         if (core.Count == 0)
         {
-            _logger.LogWarning("GexScan [{Ticker}]: no calls met core criteria.", ticker);
+            _logger.LogWarning(
+                "GexScan [{Ticker}]: no calls met core criteria — " +
+                "maxAsk=${Max:F2}/share (${Cost:F2}/contract)  budget based on 5%% of cash.",
+                ticker, maxAsk, maxAsk * 100m);
             return null;
         }
 
@@ -469,13 +513,15 @@ public class GexFunction
                 continue;
             }
 
+            // Best = highest gamma/ask ratio (most movement per dollar in momentum environment)
             var best = liquid.OrderByDescending(x => x.Score).First();
 
             _logger.LogInformation(
-                "GexScan [{Ticker}]: ★ BEST — {Symbol}  ask=${Ask:F2}  bid=${Bid:F2}  spread={Spread:P1}  " +
+                "GexScan [{Ticker}]: ★ BEST — {Symbol}  strike=${Strike:F2}  ask=${Ask:F2}/share " +
+                "(${ Cost:F2}/contract)  bid=${Bid:F2}  spread={Spread:P1}  " +
                 "delta={Delta:F3}  gamma={Gamma:F4}  gamma/ask={Score:F4}  expiry={Expiry}.",
-                ticker, best.Symbol, best.Ask, best.Bid, best.SpreadPct,
-                best.Delta, best.Gamma, best.Score, best.Expiry);
+                ticker, best.Symbol, best.Strike, best.Ask, best.Ask * 100m, best.Bid,
+                best.SpreadPct, best.Delta, best.Gamma, best.Score, best.Expiry);
 
             return (best.Symbol, best.Ask);
         }
@@ -488,24 +534,47 @@ public class GexFunction
 
     private async Task<decimal> GetLatestUnderlyingPriceAsync(string ticker)
     {
+        var bars = await FetchRecentBarsAsync(ticker, minutes: 3);
+        return bars is not null && bars.Count > 0 ? (decimal)bars[^1].Close : 0m;
+    }
+
+    /// <summary>
+    /// Momentum gate: checks whether the most recent completed 1-min bar is bullish
+    /// (close > open).  Returns null if bars cannot be fetched.
+    /// </summary>
+    private async Task<(decimal Open, decimal Close, bool IsBullish)?> GetMomentumAsync(string ticker)
+    {
+        // Fetch last 3 minutes so we always get at least one completed bar
+        // (the very latest bar may still be forming, so we use [^1] which is
+        //  the last bar returned — Alpaca returns completed bars only).
+        var bars = await FetchRecentBarsAsync(ticker, minutes: 3);
+        if (bars is null || bars.Count == 0) return null;
+
+        var bar   = bars[^1];
+        decimal o = (decimal)bar.Open;
+        decimal c = (decimal)bar.Close;
+        return (o, c, IsBullish: c > o);
+    }
+
+    private async Task<IReadOnlyList<IBar>?> FetchRecentBarsAsync(string ticker, int minutes)
+    {
         try
         {
             var utcNow   = DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Utc);
-            var utcStart = DateTime.SpecifyKind(utcNow.AddMinutes(-3), DateTimeKind.Utc);
+            var utcStart = DateTime.SpecifyKind(utcNow.AddMinutes(-minutes), DateTimeKind.Utc);
             var req = new HistoricalBarsRequest(
                 ticker, utcStart, utcNow,
                 new BarTimeFrame(1, BarTimeFrameUnit.Minute))
             { Feed = MarketDataFeed.Sip };
 
             var page = await _dataClient.ListHistoricalBarsAsync(req);
-            if (page.Items.Count > 0)
-                return (decimal)page.Items[^1].Close;
+            return page.Items;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "GexScan [{Ticker}]: failed to fetch underlying price.", ticker);
+            _logger.LogError(ex, "GexScan [{Ticker}]: failed to fetch bars.", ticker);
+            return null;
         }
-        return 0m;
     }
 
     private async Task<(decimal Bid, decimal Ask)?> GetOptionQuoteAsync(string optionSymbol, string ticker)
