@@ -39,6 +39,10 @@ var host = new HostBuilder()
         // underlying price, GEX wall above) to Azure Table Storage.
         services.AddSingleton<GexPositionStore>();
 
+        // Persists WallBounceFunction's open-position state (entry premium,
+        // put wall level for wall-break exit) to Azure Table Storage.
+        services.AddSingleton<WallBouncePositionStore>();
+
         // Cross-strategy daily risk circuit breaker (day-trade count,
         // consecutive losses, daily loss %).
         services.AddSingleton<RiskState>();

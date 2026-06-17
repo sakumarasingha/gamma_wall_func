@@ -53,11 +53,25 @@ internal static class GexAnalyzer
     ///   First strike above the underlying price where net gamma flips from
     ///   negative to positive (the "GEX zero line").  0 when not applicable.
     /// </param>
+    /// <param name="NearestPutWallBelow">
+    ///   Nearest significant negative-GEX strike at or below the underlying price
+    ///   (≥ <see cref="WallThresholdFraction"/> × chain-wide peak negative gamma).
+    ///   Dealers who sold puts must buy the underlying as price falls toward this
+    ///   level → acts as mechanical support / bounce zone.
+    ///   0 when none is found.
+    /// </param>
+    /// <param name="PutWallProximity">
+    ///   (underlyingPrice − NearestPutWallBelow) / underlyingPrice.
+    ///   0.005 = price is 0.5% above the put wall (very close).
+    ///   1.0 when no put wall is found.
+    /// </param>
     public record GexProfile(
         bool    IsNegativeGammaZone,
         decimal NearestWallAbove,
         decimal WallDistance,
-        decimal FlipLevel);
+        decimal FlipLevel,
+        decimal NearestPutWallBelow,
+        decimal PutWallProximity);
 
     /// <summary>
     /// Analyses the option chain and returns a <see cref="GexProfile"/>
@@ -68,7 +82,7 @@ internal static class GexAnalyzer
         decimal underlyingPrice)
     {
         if (chain.Count == 0 || underlyingPrice <= 0m)
-            return new GexProfile(false, 0m, 0m, 0m);
+            return new GexProfile(false, 0m, 0m, 0m, 0m, 1m);
 
         // ── 1. Accumulate net gamma per strike ───────────────────────────────
         var netGamma = new Dictionary<decimal, double>();
@@ -88,7 +102,7 @@ internal static class GexAnalyzer
         }
 
         if (netGamma.Count == 0)
-            return new GexProfile(false, 0m, 0m, 0m);
+            return new GexProfile(false, 0m, 0m, 0m, 0m, 1m);
 
         var sortedStrikes = netGamma.Keys.OrderBy(s => s).ToList();
 
@@ -128,7 +142,33 @@ internal static class GexAnalyzer
             ? nearestWall / underlyingPrice - 1m
             : 0m;
 
-        return new GexProfile(isNegativeZone, nearestWall, wallDistance, flipLevel);
+        // ── 4. Find nearest significant put wall AT or BELOW current price ────
+        //      Put walls = strikes with strongly negative net gamma (put gamma
+        //      dominates). Dealers who sold those puts must buy the underlying
+        //      as price falls to that level → mechanical support / bounce zone.
+        double peakNegative   = netGamma.Values.Where(g => g < 0).DefaultIfEmpty(0).Min(); // most negative value
+        double putWallThresh  = peakNegative * WallThresholdFraction;                      // e.g. 25% of peak
+
+        decimal nearestPutWall = 0m;
+
+        // Walk strikes at/below current price from nearest to farthest
+        foreach (var strike in sortedStrikes.Where(s => s <= underlyingPrice).OrderByDescending(s => s))
+        {
+            double g = netGamma[strike];
+            // sufficiently negative (both values negative, so g <= threshold)
+            if (putWallThresh < 0.0 && g <= putWallThresh)
+            {
+                nearestPutWall = strike;
+                break;
+            }
+        }
+
+        decimal putWallProximity = nearestPutWall > 0m
+            ? (underlyingPrice - nearestPutWall) / underlyingPrice   // 0.005 = 0.5% above wall
+            : 1m;                                                      // no wall → 100% away
+
+        return new GexProfile(isNegativeZone, nearestWall, wallDistance, flipLevel,
+                              nearestPutWall, putWallProximity);
     }
 
     // ── OCC symbol helpers ────────────────────────────────────────────────────

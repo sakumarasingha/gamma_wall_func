@@ -73,6 +73,9 @@ public class ReversalCallFunction
     private readonly ILogger<ReversalCallFunction>   _logger;
     private readonly ReversalPositionStore           _positionStore;
     private readonly RiskState                       _riskState;
+    // Cross-strategy coordination
+    private readonly GexPositionStore                _gexStore;
+    private readonly WallBouncePositionStore         _wallBounceStore;
 
     public ReversalCallFunction(
         IAlpacaTradingClient tradingClient,
@@ -81,15 +84,19 @@ public class ReversalCallFunction
         IConfiguration config,
         ILogger<ReversalCallFunction> logger,
         ReversalPositionStore positionStore,
-        RiskState riskState)
+        RiskState riskState,
+        GexPositionStore gexStore,
+        WallBouncePositionStore wallBounceStore)
     {
-        _tradingClient     = tradingClient;
-        _dataClient        = dataClient;
+        _tradingClient   = tradingClient;
+        _dataClient      = dataClient;
         _optionsDataClient = optionsDataClient;
-        _config            = config;
-        _logger            = logger;
-        _positionStore     = positionStore;
-        _riskState         = riskState;
+        _config          = config;
+        _logger          = logger;
+        _positionStore   = positionStore;
+        _riskState       = riskState;
+        _gexStore        = gexStore;
+        _wallBounceStore = wallBounceStore;
     }
 
     // ── Entry point — every 5 min, offset 30s past the minute ────────────────
@@ -238,6 +245,20 @@ public class ReversalCallFunction
         _logger.LogInformation(
             "ReversalCall [{Ticker}]: ★ ENTRY SIGNAL — bullish reversal confirmed ({Description})  price=${Price:F2}.",
             ticker, result.Description, price);
+
+        // ── Cross-strategy coordination ──────────────────────────────────────
+        if (await _gexStore.HasOpenPositionAsync(ticker))
+        {
+            _logger.LogInformation(
+                "ReversalCall [{Ticker}]: SKIP entry — GexFunction already has an open position on this ticker.", ticker);
+            return;
+        }
+        if (await _wallBounceStore.HasOpenPositionAsync(ticker))
+        {
+            _logger.LogInformation(
+                "ReversalCall [{Ticker}]: SKIP entry — WallBounce already has an open position on this ticker.", ticker);
+            return;
+        }
 
         await TryEnterCallAsync(ticker, price, now, maxSpreadPct, maxRiskPct);
     }
