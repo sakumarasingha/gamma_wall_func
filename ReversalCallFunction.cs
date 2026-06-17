@@ -102,7 +102,7 @@ public class ReversalCallFunction
     // ── Entry point — every 5 min, offset 30s past the minute ────────────────
 
     [Function("ReversalCall")]
-    public async Task Run([TimerTrigger("30 */5 * * * *")] TimerInfo timer)
+    public async Task Run([TimerTrigger("30 */5 * * * *", UseMonitor = false)] TimerInfo timer)
     {
         var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ET);
         _logger.LogInformation(
@@ -167,7 +167,7 @@ public class ReversalCallFunction
     // changing order types (Alpaca options only support Market/Limit, so the
     // exit itself is still a market sell — just triggered sooner).
     [Function("ReversalExitCheck")]
-    public async Task RunExitCheck([TimerTrigger("0 * * * * *")] TimerInfo timer)
+    public async Task RunExitCheck([TimerTrigger("0 * * * * *", UseMonitor = false)] TimerInfo timer)
     {
         var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ET);
 

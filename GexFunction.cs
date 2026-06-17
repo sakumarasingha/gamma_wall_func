@@ -108,7 +108,7 @@ public class GexFunction
     // ── Entry scan — every 5 minutes ─────────────────────────────────────────
 
     [Function("GexScan")]
-    public async Task RunScan([TimerTrigger("30 */5 * * * *")] TimerInfo timer)
+    public async Task RunScan([TimerTrigger("30 */5 * * * *", UseMonitor = false)] TimerInfo timer)
     {
         var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ET);
         _logger.LogInformation("GexScan: tick at {Time} ET ({Day}).", now.ToString("HH:mm:ss"), now.DayOfWeek);
@@ -136,7 +136,7 @@ public class GexFunction
     // ── Exit check — every 1 minute ──────────────────────────────────────────
 
     [Function("GexExitCheck")]
-    public async Task RunExitCheck([TimerTrigger("0 * * * * *")] TimerInfo timer)
+    public async Task RunExitCheck([TimerTrigger("10 * * * * *", UseMonitor = false)] TimerInfo timer)
     {
         var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ET);
 

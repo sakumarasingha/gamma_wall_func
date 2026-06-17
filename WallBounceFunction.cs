@@ -107,7 +107,7 @@ public class WallBounceFunction
     // ── Main timer — every 1 minute ──────────────────────────────────────────
 
     [Function("WallBounce")]
-    public async Task Run([TimerTrigger("0 * * * * *")] TimerInfo timer)
+    public async Task Run([TimerTrigger("20 * * * * *", UseMonitor = false)] TimerInfo timer)
     {
         var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ET);
 
