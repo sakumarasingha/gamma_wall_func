@@ -35,6 +35,10 @@ var host = new HostBuilder()
         // survives host restarts / cold starts.
         services.AddSingleton<ReversalPositionStore>();
 
+        // Persists GexFunction's open-position state (entry premium, entry
+        // underlying price, GEX wall above) to Azure Table Storage.
+        services.AddSingleton<GexPositionStore>();
+
         // Cross-strategy daily risk circuit breaker (day-trade count,
         // consecutive losses, daily loss %).
         services.AddSingleton<RiskState>();

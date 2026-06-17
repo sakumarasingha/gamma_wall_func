@@ -39,11 +39,6 @@ public sealed class ReversalPositionStore
         // True once profit has reached TrailingActivatePct (15%) — once true,
         // a pullback of TrailingStepPct (5%) from the peak closes the trade.
         public bool    TrailingActive { get; set; }
-        // GEX wall level captured at entry (first significant positive-GEX
-        // strike above the underlying price at the time of entry). When the
-        // underlying approaches this level, we exit before the pinning zone
-        // stalls momentum. 0 = no wall was identified at entry time.
-        public decimal GexWallAbove   { get; set; }
     }
 
     private readonly TableClient _table;
@@ -94,14 +89,13 @@ public sealed class ReversalPositionStore
                     EntryTime       = entity.GetDateTimeOffset("EntryTime")?.DateTime ?? DateTime.UtcNow,
                     PeakPremium     = (decimal)(entity.GetDouble("PeakPremium")     ?? 0.0),
                     TrailingActive  = entity.GetBoolean("TrailingActive") ?? false,
-                    GexWallAbove    = (decimal)(entity.GetDouble("GexWallAbove")    ?? 0.0),
                 };
                 _cache[entity.RowKey] = pos;
 
                 _logger.LogInformation(
                     "ReversalPositionStore: restored open position — {Ticker} {Symbol}  " +
-                    "entryPremium=${Entry:F2}  peak=${Peak:F2}  trailingActive={Trailing}  gexWall=${Wall:F2}.",
-                    entity.RowKey, pos.OptionSymbol, pos.EntryPremium, pos.PeakPremium, pos.TrailingActive, pos.GexWallAbove);
+                    "entryPremium=${Entry:F2}  peak=${Peak:F2}  trailingActive={Trailing}.",
+                    entity.RowKey, pos.OptionSymbol, pos.EntryPremium, pos.PeakPremium, pos.TrailingActive);
             }
 
             int count = _cache.Count;
@@ -149,9 +143,7 @@ public sealed class ReversalPositionStore
 
     // ── Writes ────────────────────────────────────────────────────────────────
 
-    public async Task OpenAsync(
-        string ticker, string optionSymbol, decimal entryPremium,
-        decimal entryUnderlying, DateTime entryTime, decimal gexWallAbove = 0m)
+    public async Task OpenAsync(string ticker, string optionSymbol, decimal entryPremium, decimal entryUnderlying, DateTime entryTime)
     {
         await EnsureLoadedAsync();
 
@@ -163,7 +155,6 @@ public sealed class ReversalPositionStore
             EntryTime       = entryTime,
             PeakPremium     = entryPremium,
             TrailingActive  = false,
-            GexWallAbove    = gexWallAbove,
         };
 
         _cache[ticker] = pos;
@@ -204,7 +195,6 @@ public sealed class ReversalPositionStore
             { "EntryTime",       new DateTimeOffset(DateTime.SpecifyKind(pos.EntryTime, DateTimeKind.Unspecified), TimeSpan.Zero) },
             { "PeakPremium",     (double)pos.PeakPremium },
             { "TrailingActive",  pos.TrailingActive },
-            { "GexWallAbove",    (double)pos.GexWallAbove },
         };
 
         try

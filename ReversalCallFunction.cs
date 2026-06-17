@@ -293,24 +293,6 @@ public class ReversalCallFunction
             return;
         }
 
-        // ── GEX wall exit — take profit as underlying approaches the gamma
-        // pinning zone captured at entry. Positive GEX walls attract price
-        // near expiry but then slow / pin it — exiting just before the wall
-        // (within 0.3%) captures most of the move while avoiding the stall. ─
-        if (pos.GexWallAbove > 0m)
-        {
-            decimal underlying = await GetLatestUnderlyingPriceAsync(ticker);
-            if (underlying > 0m && underlying >= pos.GexWallAbove * 0.997m)
-            {
-                _logger.LogInformation(
-                    "ReversalCall [{Ticker}]: EXIT — GEX WALL REACHED. underlying ${Price:F2} within 0.3% of " +
-                    "wall ${Wall:F2}. Taking profit before pinning zone. premium=${Current:F2} ({Pnl:P1}).",
-                    ticker, underlying, pos.GexWallAbove, currentPremium, pnlPct);
-                await ClosePositionAsync(ticker, pos, now, $"GEX WALL REACHED (${pos.GexWallAbove:F2})", currentPremium);
-                return;
-            }
-        }
-
         // ── Arm trailing stop once premium is +15% from entry ───────────────
         if (!pos.TrailingActive && currentPremium >= pos.EntryPremium * (1m + TrailingActivatePct))
         {
@@ -428,39 +410,8 @@ public class ReversalCallFunction
             return;
         }
 
-        // Gate C — fetch full chain (calls + puts, wide strikes) for GEX analysis
-        //          and call selection from the same API response.
-        var chain = await FetchFullChainAsync(ticker, currentPrice, now);
-        if (chain is null) return;
-
-        // Gate D — Net GEX analysis (negative zone + wall distance)
-        var gex = GexAnalyzer.Analyse(chain.Items, currentPrice);
-
-        _logger.LogInformation(
-            "ReversalCall [{Ticker}]: GEX — negativeZone={Neg}  nearestWall=${Wall:F2}  wallDist={Dist:P1}  flip=${Flip:F2}.",
-            ticker, gex.IsNegativeGammaZone, gex.NearestWallAbove, gex.WallDistance, gex.FlipLevel);
-
-        if (!gex.IsNegativeGammaZone)
-        {
-            _logger.LogInformation(
-                "ReversalCall [{Ticker}]: SKIP — price ${Price:F2} is in a positive GEX zone " +
-                "(dealers long gamma → pinning/mean-reversion likely, not a trending environment).",
-                ticker, currentPrice);
-            return;
-        }
-
-        const decimal MinWallDistance = 0.02m;  // need at least 2% room to the nearest gamma wall
-        if (gex.NearestWallAbove > 0m && gex.WallDistance < MinWallDistance)
-        {
-            _logger.LogInformation(
-                "ReversalCall [{Ticker}]: SKIP — nearest GEX wall ${Wall:F2} is only {Dist:P1} above ${Price:F2} " +
-                "(< {Min:P0} minimum room) — move is likely to stall quickly.",
-                ticker, gex.NearestWallAbove, gex.WallDistance, currentPrice, MinWallDistance);
-            return;
-        }
-
-        // Gate E — select best call from the chain we already fetched
-        var best = SelectBestCallFromChain(ticker, chain.Items, currentPrice, maxAsk, maxSpreadPct, now);
+        // Gate C — find best call option
+        var best = await FindBestCallOptionAsync(ticker, currentPrice, maxAsk, maxSpreadPct, now);
         if (best is null)
         {
             _logger.LogWarning(
@@ -469,7 +420,7 @@ public class ReversalCallFunction
             return;
         }
 
-        // Gate F — hard cash check
+        // Gate D — hard cash check
         decimal contractCost = best.Value.Ask * 100m;
         if (cash < contractCost)
         {
@@ -479,74 +430,54 @@ public class ReversalCallFunction
             return;
         }
 
-        await PlaceCallBuyOrderAsync(ticker, best.Value.Symbol, currentPrice, best.Value.Ask, now, gex.NearestWallAbove);
+        await PlaceCallBuyOrderAsync(ticker, best.Value.Symbol, currentPrice, best.Value.Ask, now);
     }
 
     // ── Option selection ──────────────────────────────────────────────────────
 
-    // ── Chain fetch (wide — for GEX + call selection in one API call) ─────────
-
-    private async Task<IDictionaryPage<IOptionSnapshot>?> FetchFullChainAsync(
-        string ticker, decimal underlyingPrice, DateTime now)
+    private async Task<(string Symbol, decimal Ask)?> FindBestCallOptionAsync(
+        string ticker, decimal underlyingPrice, decimal maxAsk, decimal maxSpreadPct, DateTime now)
     {
-        // Wide ±10% strike range and 0–30 DTE so GEX can see walls and
-        // flip levels that live outside the narrow call-selection window.
-        var     minExpiry = DateOnly.FromDateTime(now.Date);
-        var     maxExpiry = DateOnly.FromDateTime(now.Date.AddDays(30));
-        decimal floor     = Math.Round(underlyingPrice * 0.90m, 2);
-        decimal ceiling   = Math.Round(underlyingPrice * 1.10m, 2);
+        var     minExpiry     = DateOnly.FromDateTime(now.Date);
+        var     maxExpiry     = DateOnly.FromDateTime(now.Date.AddDays(10));
+        decimal strikeFloor   = Math.Round(underlyingPrice * 0.99m, 2);
+        decimal strikeCeiling = Math.Round(underlyingPrice * 1.05m, 2);
 
         _logger.LogInformation(
-            "ReversalCall [{Ticker}]: full chain request (calls + puts) — expiry {Min}–{Max}  " +
-            "strike {Floor:F2}–{Ceil:F2} (±10%).",
-            ticker, minExpiry, maxExpiry, floor, ceiling);
+            "ReversalCall [{Ticker}]: call chain request — expiry {Min}–{Max}  strike {Floor:F2}–{Ceil:F2}  maxAsk=${MaxAsk:F2}.",
+            ticker, minExpiry, maxExpiry, strikeFloor, strikeCeiling, maxAsk);
 
+        IDictionaryPage<IOptionSnapshot> chainPage;
         try
         {
             var req = new OptionChainRequest(ticker)
             {
                 ExpirationDateGreaterThanOrEqualTo = minExpiry,
                 ExpirationDateLessThanOrEqualTo    = maxExpiry,
-                // No OptionType filter — we need calls AND puts for net GEX
-                StrikePriceGreaterThanOrEqualTo    = floor,
-                StrikePriceLessThanOrEqualTo       = ceiling,
+                OptionType                         = OptionType.Call,
+                StrikePriceGreaterThanOrEqualTo    = strikeFloor,
+                StrikePriceLessThanOrEqualTo       = strikeCeiling,
             };
-
-            var page = await _optionsDataClient.GetOptionChainAsync(req);
-
+            chainPage = await _optionsDataClient.GetOptionChainAsync(req);
             _logger.LogInformation(
-                "ReversalCall [{Ticker}]: full chain returned {Count} contract(s) (calls + puts, 0-30 DTE, ±10%).",
-                ticker, page.Items.Count);
-
-            if (page.Items.Count == 0)
-            {
-                _logger.LogWarning("ReversalCall [{Ticker}]: empty chain — no contracts in range.", ticker);
-                return null;
-            }
-
-            return page;
+                "ReversalCall [{Ticker}]: chain returned {Count} contract(s) total.", ticker, chainPage.Items.Count);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "ReversalCall [{Ticker}]: failed to fetch full option chain.", ticker);
+            _logger.LogError(ex, "ReversalCall [{Ticker}]: failed to fetch call chain.", ticker);
             return null;
         }
-    }
 
-    // ── Call selection from pre-fetched chain ─────────────────────────────────
+        if (chainPage.Items.Count == 0)
+        {
+            _logger.LogWarning(
+                "ReversalCall [{Ticker}]: empty chain — no calls exist for expiry {Min}–{Max} strike {Floor:F2}–{Ceil:F2}.",
+                ticker, minExpiry, maxExpiry, strikeFloor, strikeCeiling);
+            return null;
+        }
 
-    private (string Symbol, decimal Ask)? SelectBestCallFromChain(
-        string ticker,
-        IReadOnlyDictionary<string, IOptionSnapshot> chain,
-        decimal underlyingPrice, decimal maxAsk, decimal maxSpreadPct, DateTime now)
-    {
-        // Apply narrow filters for the trade itself: 0-10 DTE, tight strike range.
-        var     maxCallExpiry = DateOnly.FromDateTime(now.Date.AddDays(10));
-        decimal strikeFloor   = Math.Round(underlyingPrice * 0.99m, 2);
-        decimal strikeCeiling = Math.Round(underlyingPrice * 1.05m, 2);
-
-        var allCalls = chain
-            .Where(kv => GexAnalyzer.IsCall(kv.Key))   // calls only
+        // Scoring: gamma/ask = most gamma exposure per dollar spent.
+        var allCandidates = chainPage.Items
             .Select(kv =>
             {
                 decimal ask       = kv.Value.Quote?.AskPrice ?? 0m;
@@ -555,18 +486,12 @@ public class ReversalCallFunction
                 decimal gamma     = kv.Value.Greeks?.Gamma ?? 0m;
                 decimal spreadPct = ask > 0m ? (ask - bid) / ask : 1m;
                 decimal score     = ask > 0m ? gamma / ask : 0m;
-                DateOnly expiry   = ParseExpiryFromSymbol(kv.Key, now);
-                decimal  strike   = GexAnalyzer.ParseStrike(kv.Key);
-
                 bool meetsCore =
                     ask >= 1.00m && ask <= maxAsk
                  && delta >= 0.30m && delta <= 0.65m
-                 && gamma > 0m
-                 && expiry <= maxCallExpiry
-                 && strike >= strikeFloor && strike <= strikeCeiling;
-
+                 && gamma > 0m;
                 bool liquid = spreadPct < maxSpreadPct;
-
+                DateOnly expiry = ParseExpiryFromSymbol(kv.Key, now);
                 return (Symbol: kv.Key, Ask: ask, Bid: bid, SpreadPct: spreadPct, Delta: delta,
                         Gamma: gamma, Score: score, Expiry: expiry, MeetsCore: meetsCore, Liquid: liquid);
             })
@@ -574,30 +499,32 @@ public class ReversalCallFunction
             .ThenByDescending(x => x.Score)
             .ToList();
 
-        var core = allCalls.Where(x => x.MeetsCore).ToList();
+        var coreCandidates = allCandidates.Where(x => x.MeetsCore).ToList();
 
         _logger.LogInformation(
-            "ReversalCall [{Ticker}]: call selection — {Pass}/{Total} call(s) passed core filters " +
-            "(ask $1–${MaxAsk:F2}, delta 0.30–0.65, gamma > 0, ≤ {MaxExpiry}, strike {Floor:F2}–{Ceil:F2}).",
-            ticker, core.Count, allCalls.Count, maxAsk, maxCallExpiry, strikeFloor, strikeCeiling);
+            "ReversalCall [{Ticker}]: {Pass}/{Total} contract(s) passed core filters " +
+            "(ask $1–${MaxAsk:F2}, delta +0.30–+0.65, gamma > 0).",
+            ticker, coreCandidates.Count, chainPage.Items.Count, maxAsk);
 
-        if (core.Count == 0)
+        if (coreCandidates.Count == 0)
         {
             _logger.LogWarning(
-                "ReversalCall [{Ticker}]: no calls met core criteria — maxAsk=${MaxAsk:F2}.", ticker, maxAsk);
+                "ReversalCall [{Ticker}]: no contracts met core criteria — maxAsk=${MaxAsk:F2}.", ticker, maxAsk);
             return null;
         }
 
-        foreach (var expiry in core.Select(x => x.Expiry).Distinct().OrderBy(e => e))
+        var expiries = coreCandidates.Select(x => x.Expiry).Distinct().OrderBy(e => e).ToList();
+
+        foreach (var expiry in expiries)
         {
-            var atExpiry       = core.Where(x => x.Expiry == expiry).ToList();
+            var atExpiry       = coreCandidates.Where(x => x.Expiry == expiry).ToList();
             var liquidAtExpiry = atExpiry.Where(x => x.Liquid).ToList();
 
             if (liquidAtExpiry.Count == 0)
             {
                 _logger.LogWarning(
-                    "ReversalCall [{Ticker}]: expiry {Expiry} — no liquid calls (spread < {MaxSpread:P0}) " +
-                    "among {Count} — trying next expiry.",
+                    "ReversalCall [{Ticker}]: expiry {Expiry} — no liquidity (need spread < {MaxSpread:P0}) " +
+                    "among {Count} candidate(s) — trying next expiry.",
                     ticker, expiry, maxSpreadPct, atExpiry.Count);
                 continue;
             }
@@ -605,18 +532,18 @@ public class ReversalCallFunction
             var best = liquidAtExpiry.OrderByDescending(x => x.Score).First();
 
             _logger.LogInformation(
-                "ReversalCall [{Ticker}]: ★ BEST CALL — {Symbol}  ask=${Ask:F2}  bid=${Bid:F2}  " +
-                "spread={Spread:P1}  delta={Delta:F3}  gamma={Gamma:F4}  gamma/ask={Score:F4}  expiry={Expiry}  " +
-                "({Count} liquid call(s) at this expiry).",
-                ticker, best.Symbol, best.Ask, best.Bid, best.SpreadPct, best.Delta, best.Gamma,
-                best.Score, best.Expiry, liquidAtExpiry.Count);
+                "ReversalCall [{Ticker}]: ★ BEST — {Symbol}  ask=${Ask:F2}  bid=${Bid:F2}  spread={Spread:P1}  " +
+                "delta={Delta:F3}  gamma={Gamma:F4}  gamma/ask={Score:F4}  expiry={Expiry}  " +
+                "({Count} liquid candidate(s) at this expiry).",
+                ticker, best.Symbol, best.Ask, best.Bid, best.SpreadPct, best.Delta, best.Gamma, best.Score,
+                best.Expiry, liquidAtExpiry.Count);
 
             return (best.Symbol, best.Ask);
         }
 
         _logger.LogWarning(
-            "ReversalCall [{Ticker}]: SKIP — no liquid call found within 10 DTE (spread < {MaxSpread:P0}).",
-            ticker, maxSpreadPct);
+            "ReversalCall [{Ticker}]: SKIP — no liquid contract found at any expiry {Min}–{Max} (spread < {MaxSpread:P0}).",
+            ticker, minExpiry, maxExpiry, maxSpreadPct);
         return null;
     }
 
@@ -657,34 +584,6 @@ public class ReversalCallFunction
         return null;
     }
 
-    // ── Latest underlying price (for GEX wall exit check) ────────────────────
-
-    private async Task<decimal> GetLatestUnderlyingPriceAsync(string ticker)
-    {
-        try
-        {
-            var utcNow   = DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Utc);
-            var utcStart = DateTime.SpecifyKind(utcNow.AddMinutes(-3), DateTimeKind.Utc);
-            var req = new HistoricalBarsRequest(
-                ticker, utcStart, utcNow,
-                new BarTimeFrame(1, BarTimeFrameUnit.Minute))
-            { Feed = MarketDataFeed.Sip };
-
-            var page = await _dataClient.ListHistoricalBarsAsync(req);
-            if (page.Items.Count > 0)
-                return (decimal)page.Items[^1].Close;
-
-            _logger.LogWarning(
-                "ReversalCall [{Ticker}]: GetLatestUnderlyingPrice — no bars returned in last 3 min.", ticker);
-            return 0m;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "ReversalCall [{Ticker}]: failed to fetch latest underlying price.", ticker);
-            return 0m;
-        }
-    }
-
     // ── Latest option quote (for exit checks) ────────────────────────────────
 
     private async Task<(decimal Bid, decimal Ask)?> GetOptionQuoteAsync(string optionSymbol, string ticker)
@@ -710,8 +609,7 @@ public class ReversalCallFunction
     // ── Order helpers ─────────────────────────────────────────────────────────
 
     private async Task PlaceCallBuyOrderAsync(
-        string ticker, string optionSymbol, decimal currentPrice, decimal premium, DateTime now,
-        decimal gexWallAbove = 0m)
+        string ticker, string optionSymbol, decimal currentPrice, decimal premium, DateTime now)
     {
         try
         {
@@ -724,12 +622,11 @@ public class ReversalCallFunction
 
             _logger.LogInformation(
                 "ReversalCall [{Ticker}]: ✔ BUY order accepted — orderId={OrderId}  symbol={Symbol}  status={Status}  " +
-                "underlying={Price:F2}  premium(ask)={Premium:F2}  gexWall={Wall}  " +
-                "exit on -15% stop loss · GEX wall · trailing stop (arms at +15%, trails 5% below peak).",
-                ticker, order.OrderId, optionSymbol, order.OrderStatus, currentPrice, premium,
-                gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none");
+                "underlying={Price:F2}  premium(ask)={Premium:F2}  " +
+                "exit on -15% stop loss or trailing stop (arms at +15%, trails 5% below peak).",
+                ticker, order.OrderId, optionSymbol, order.OrderStatus, currentPrice, premium);
 
-            await _positionStore.OpenAsync(ticker, optionSymbol, premium, currentPrice, now, gexWallAbove);
+            await _positionStore.OpenAsync(ticker, optionSymbol, premium, currentPrice, now);
 
             decimal? strike = ParseStrikeFromSymbol(optionSymbol);
 
