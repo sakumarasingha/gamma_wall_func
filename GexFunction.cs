@@ -37,11 +37,14 @@ using Microsoft.Extensions.Logging;
 ///                5. Buy 1 near-ATM call with best gamma/ask score, ≤ 10 DTE.
 ///
 ///     Exit   — Checked every 1 minute (GexExitCheck timer) once a position is open:
-///                • Stop loss   — close if premium falls 20% from entry.
-///                • GEX wall    — close when underlying comes within 0.3% of the
-///                                wall level captured at entry (lock in gain before pinning).
-///                • EOD         — force-close at 15:50 ET regardless of signal
-///                                (avoids overnight gap / assignment risk).
+///                • Stop loss      — close if premium falls 20% from entry.
+///                • GEX wall       — close when underlying comes within 0.3% of the
+///                                   wall level captured at entry (lock in gain before pinning).
+///                • Trailing stop  — arms once premium is up ≥ 5% from entry;
+///                                   trail level = currentPremium × 0.98, ratchets up as premium
+///                                   rises, never down — closes when premium drops below trail.
+///                • EOD            — force-close at 15:50 ET regardless of signal
+///                                   (avoids overnight gap / assignment risk).
 ///
 /// Runs:
 ///   GexFunction    — every 5 minutes, 9:45–15:55 ET, weekdays.
@@ -54,7 +57,7 @@ public class GexFunction
 
     // ── Tuneable parameters ───────────────────────────────────────────────────
     // Sized for a ~$2 000 account, max $1 000 per trade in REAL premium:
-    //   • Min ask $3/share ($300/contract) — no worthless cheap OTM junk
+    //   • Min ask $1/share ($100/contract) — filters out near-worthless OTM junk
     //   • Max ask $10/share ($1 000/contract) — hard cap at $1 000 spend
     //   • Delta 0.40–0.70 — near-ATM calls with real directional exposure
     //   • Strike -3% to +2% — slightly ITM to just OTM (quality, not lottery)
@@ -66,8 +69,10 @@ public class GexFunction
     private const decimal MaxSpreadPct      = 0.10m;  // 10% spread — tighter; real premium options have tighter markets
     private const decimal MaxRiskPct        = 0.50m;  // 50% of cash = $1 000 on $2 000 account
     private const decimal StopLossPct       = 0.20m;  // 20% stop — real premium, so 20% is a meaningful $ loss
-    private const decimal MinWallDistance   = 0.02m;  // skip if GEX wall < 2% above price
-    private const decimal WallExitBuffer    = 0.003m; // exit when underlying within 0.3% of GEX wall
+    private const decimal MinWallDistance       = 0.02m;  // skip if GEX wall < 2% above price
+    private const decimal WallExitBuffer        = 0.003m; // exit when underlying within 0.3% of GEX wall
+    private const decimal TrailingActivatePct   = 0.05m;  // trailing stop arms at +5% premium profit
+    private const decimal TrailingStepPct       = 0.02m;  // trail level = currentPremium × (1 − 0.02)
 
     private static readonly TimeSpan EodForceCloseTime = new(15, 50, 0);
 
@@ -406,12 +411,44 @@ public class GexFunction
             }
         }
 
+        // ── Trailing stop ─────────────────────────────────────────────────────
+        if (!pos.TrailingActive && pnlPct >= TrailingActivatePct)
+        {
+            pos.TrailingActive = true;
+            pos.PeakPremium    = currentPremium;
+            _logger.LogInformation(
+                "GexExitCheck [{Ticker}]: trailing stop ARMED at premium=${Peak:F2} ({Pnl:P1}).",
+                ticker, pos.PeakPremium, pnlPct);
+            await _positionStore.SaveAsync(ticker, pos);
+        }
+
+        if (pos.TrailingActive)
+        {
+            if (currentPremium > pos.PeakPremium)
+            {
+                pos.PeakPremium = currentPremium;
+                await _positionStore.SaveAsync(ticker, pos);
+            }
+
+            decimal trailLevel = pos.PeakPremium * (1m - TrailingStepPct);
+            if (currentPremium <= trailLevel)
+            {
+                _logger.LogInformation(
+                    "GexExitCheck [{Ticker}]: EXIT — TRAILING STOP. premium=${Current:F2} below trail=${Trail:F2} " +
+                    "(peak=${Peak:F2}  {Pnl:P1}).",
+                    ticker, currentPremium, trailLevel, pos.PeakPremium, pnlPct);
+                await ClosePositionAsync(ticker, pos, now, $"TRAILING STOP (peak=${pos.PeakPremium:F2})", currentPremium);
+                return;
+            }
+        }
+
         // Holding — log status
         _logger.LogInformation(
             "GexExitCheck [{Ticker}]: holding {Symbol} — premium=${Current:F2} ({Pnl:P1})  " +
-            "entry=${Entry:F2}  gexWall={Wall}.",
+            "entry=${Entry:F2}  gexWall={Wall}  trail={Trail}.",
             ticker, pos.OptionSymbol, currentPremium, pnlPct, pos.EntryPremium,
-            pos.GexWallAbove > 0m ? $"${pos.GexWallAbove:F2}" : "none");
+            pos.GexWallAbove > 0m ? $"${pos.GexWallAbove:F2}" : "none",
+            pos.TrailingActive ? $"armed (peak=${pos.PeakPremium:F2})" : "not armed");
     }
 
     // ── Chain fetch ───────────────────────────────────────────────────────────
@@ -631,9 +668,9 @@ public class GexFunction
             _logger.LogInformation(
                 "GexScan [{Ticker}]: ✔ BUY accepted — orderId={Id}  status={Status}  " +
                 "underlying=${Price:F2}  premium(ask)=${Premium:F2}  gexWall={Wall}  " +
-                "exit: -{Stop:P0} stop loss · GEX wall · EOD close.",
+                "exit: -{Stop:P0} stop loss · trailing stop (+{Arm:P0} arms, {Step:P0} trail) · GEX wall · EOD close.",
                 ticker, order.OrderId, order.OrderStatus, underlyingPrice, premium,
-                gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none", StopLossPct);
+                gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none", StopLossPct, TrailingActivatePct, TrailingStepPct);
 
             await _positionStore.OpenAsync(ticker, optionSymbol, premium, underlyingPrice, now, gexWallAbove);
 
@@ -764,7 +801,7 @@ public class GexFunction
                       <td style="padding:8px 16px;font-weight:bold;color:#0d6efd">{(gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none identified")}</td></tr>
                   <tr style="background:#f9f9f9"><td style="padding:8px 16px;color:#555">Exit Plan</td>
                       <td style="padding:8px 16px;color:#c0392b;font-weight:bold">
-                        Stop loss -{StopLossPct:P0} premium · GEX wall exit · EOD force-close at {EodForceCloseTime}
+                        Stop loss -{StopLossPct:P0} · trailing stop (+{TrailingActivatePct:P0} arms, {TrailingStepPct:P0} trail) · GEX wall exit · EOD force-close at {EodForceCloseTime}
                       </td></tr>
                   """
                 : $"""

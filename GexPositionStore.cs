@@ -20,6 +20,10 @@ public sealed class GexPositionStore
         public required DateTime EntryTime       { get; init; }
         // GEX call wall captured at entry — close when underlying approaches this level.
         public decimal           GexWallAbove    { get; init; }
+        // High-water mark used by the trailing stop (currentPremium × 0.98, ratchets up only).
+        public decimal           PeakPremium     { get; set; }
+        // True once premium has gained ≥ TrailingActivatePct from entry.
+        public bool              TrailingActive  { get; set; }
     }
 
     private readonly ConcurrentDictionary<string, Position> _cache = new();
@@ -47,6 +51,8 @@ public sealed class GexPositionStore
             EntryUnderlying = entryUnderlying,
             EntryTime       = entryTime,
             GexWallAbove    = gexWallAbove,
+            PeakPremium     = entryPremium,
+            TrailingActive  = false,
         };
 
         _logger.LogInformation(
@@ -57,6 +63,9 @@ public sealed class GexPositionStore
 
         return Task.CompletedTask;
     }
+
+    // Mutations to Position properties are reflected in-memory immediately — no-op save needed.
+    public Task SaveAsync(string ticker, Position pos) => Task.CompletedTask;
 
     public Task CloseAsync(string ticker)
     {
