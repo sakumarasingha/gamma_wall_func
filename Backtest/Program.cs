@@ -8,7 +8,7 @@ using Alpaca.Markets;
 //
 // Scans every 15-min bar over the last ~3 months. Whenever
 // PatternDetector.DetectBullishReversal fires (and no position is currently
-// open), simulates one trade using the SAME exit rules as ReversalCallFunction:
+// open), simulates one trade using the exit rules from the reversal pattern:
 //   - Stop loss:     premium falls 50% from entry  -> close
 //   - Trailing stop: arms once premium is +25% from entry, then closes if
 //                     premium pulls back 5% from its running peak

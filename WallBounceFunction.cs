@@ -79,7 +79,6 @@ public class WallBounceFunction
     private readonly WallBouncePositionStore       _positionStore;
     private readonly RiskState                     _riskState;
     // Cross-strategy coordination
-    private readonly ReversalPositionStore         _reversalStore;
     private readonly GexPositionStore              _gexStore;
 
     public WallBounceFunction(
@@ -90,7 +89,6 @@ public class WallBounceFunction
         ILogger<WallBounceFunction> logger,
         WallBouncePositionStore positionStore,
         RiskState riskState,
-        ReversalPositionStore reversalStore,
         GexPositionStore gexStore)
     {
         _tradingClient     = tradingClient;
@@ -100,7 +98,6 @@ public class WallBounceFunction
         _logger            = logger;
         _positionStore     = positionStore;
         _riskState         = riskState;
-        _reversalStore     = reversalStore;
         _gexStore          = gexStore;
     }
 
@@ -291,12 +288,6 @@ public class WallBounceFunction
         }
 
         // ── Cross-strategy coordination ──────────────────────────────────────
-        if (await _reversalStore.HasOpenPositionAsync(ticker))
-        {
-            _logger.LogInformation(
-                "WallBounce [{Ticker}]: SKIP entry — ReversalCall already has an open position on this ticker.", ticker);
-            return;
-        }
         if (await _gexStore.HasOpenPositionAsync(ticker))
         {
             _logger.LogInformation(

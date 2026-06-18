@@ -6,8 +6,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
-/// Account-wide daily risk circuit breaker used by ReversalCallFunction
-/// (and any future strategies). Backed by Azure Table Storage
+/// Account-wide daily risk circuit breaker shared across strategies. Backed by Azure Table Storage
 /// (single row, "RiskState"/"Daily") so the day's counters survive host
 /// restarts.
 ///

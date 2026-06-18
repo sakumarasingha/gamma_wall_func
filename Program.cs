@@ -33,7 +33,6 @@ var host = new HostBuilder()
         // In-memory position stores (one singleton per strategy).
         // State lives for the lifetime of the host process — a restart clears
         // open positions, so ensure no trades are open before redeploying.
-        services.AddSingleton<ReversalPositionStore>();
         services.AddSingleton<GexPositionStore>();
         services.AddSingleton<WallBouncePositionStore>();
 

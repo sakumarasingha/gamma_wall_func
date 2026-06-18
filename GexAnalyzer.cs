@@ -35,7 +35,7 @@ internal static class GexAnalyzer
     private const double WallThresholdFraction = 0.25;
 
     /// <summary>
-    /// The GEX snapshot used by <see cref="ReversalCallFunction"/> at entry.
+    /// The GEX snapshot captured at entry.
     /// </summary>
     /// <param name="IsNegativeGammaZone">
     ///   True when the net gamma at (or nearest below) the current underlying

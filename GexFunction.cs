@@ -80,7 +80,6 @@ public class GexFunction
     private readonly RiskState                    _riskState;
     // Cross-strategy coordination — skip entry if another strategy is already
     // in a position on the same ticker (prevents doubling up on the same name).
-    private readonly ReversalPositionStore        _reversalStore;
     private readonly WallBouncePositionStore      _wallBounceStore;
 
     public GexFunction(
@@ -91,7 +90,6 @@ public class GexFunction
         ILogger<GexFunction> logger,
         GexPositionStore positionStore,
         RiskState riskState,
-        ReversalPositionStore reversalStore,
         WallBouncePositionStore wallBounceStore)
     {
         _tradingClient   = tradingClient;
@@ -101,7 +99,6 @@ public class GexFunction
         _logger          = logger;
         _positionStore   = positionStore;
         _riskState       = riskState;
-        _reversalStore   = reversalStore;
         _wallBounceStore = wallBounceStore;
     }
 
@@ -215,15 +212,7 @@ public class GexFunction
         }
 
         // ── Cross-strategy coordination ──────────────────────────────────────
-        // Skip entry if ReversalCall or WallBounce already holds a position on
-        // this ticker — prevents two strategies doubling up on the same name
-        // and breaching the per-ticker risk budget.
-        if (await _reversalStore.HasOpenPositionAsync(ticker))
-        {
-            _logger.LogInformation(
-                "GexScan [{Ticker}]: SKIP entry — ReversalCall already has an open position on this ticker.", ticker);
-            return;
-        }
+        // Skip entry if WallBounce already holds a position on this ticker.
         if (await _wallBounceStore.HasOpenPositionAsync(ticker))
         {
             _logger.LogInformation(
