@@ -62,7 +62,7 @@ public class WallBounceFunction
     //   option price rises (never decreases). This means the stop always sits
     //   2% below the best price seen since the trailing stop armed.
     //   Close when currentPremium drops below trailLevel.
-    private const decimal MaxRiskPct          = 0.50m;  // 50% of tradable cash per trade ($1 000 on $2 000)
+    private const decimal MaxRiskPct          = 1.00m;  // 100% of tradable cash
     private const decimal MaxSpreadPct        = 0.10m;  // max bid/ask spread as % of ask
     private const decimal PutWallProximityPct = 0.01m;  // entry only if price within 1% of put wall
     private const decimal StopLossPct         = 0.20m;  // hard stop: exit if premium down 20% from entry

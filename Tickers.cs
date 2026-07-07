@@ -13,5 +13,6 @@ public static class Tickers
         "MSFT",
         "SPY",
         "QQQ",
+        "SPCX"
     ];
 }

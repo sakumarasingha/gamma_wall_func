@@ -67,7 +67,7 @@ public class GexFunction
     //     • Stop loss 20% → max loss $100 on that contract
     //     • GEX wall exit locks in gain before pinning; EOD if still open
     private const decimal MaxSpreadPct      = 0.10m;  // 10% spread — tighter; real premium options have tighter markets
-    private const decimal MaxRiskPct        = 0.50m;  // 50% of cash = $1 000 on $2 000 account
+    private const decimal MaxRiskPct        = 1.00m;  // 100% of cash
     private const decimal StopLossPct       = 0.20m;  // 20% stop — real premium, so 20% is a meaningful $ loss
     private const decimal MinWallDistance       = 0.02m;  // skip if GEX wall < 2% above price
     private const decimal WallExitBuffer        = 0.003m; // exit when underlying within 0.3% of GEX wall
