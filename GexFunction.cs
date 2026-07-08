@@ -70,6 +70,7 @@ public class GexFunction
     private const decimal MaxRiskPct        = 1.00m;  // 100% of cash
     private const decimal StopLossPct       = 0.20m;  // 20% stop — real premium, so 20% is a meaningful $ loss
     private const decimal MinWallDistance       = 0.02m;  // skip if GEX wall < 2% above price
+    private const decimal NearFlipBuffer        = 0.003m; // skip entry if spot within 0.3% of gamma flip (chop zone)
     private const decimal WallExitBuffer        = 0.003m; // exit when underlying within 0.3% of GEX wall
     private const decimal TrailingActivatePct   = 0.05m;  // trailing stop arms at +5% premium profit
     private const decimal TrailingStepPct       = 0.02m;  // trail level = currentPremium × (1 − 0.02)
@@ -263,6 +264,22 @@ public class GexFunction
             return;
         }
 
+        // Gate: skip if price is within 0.3% of the gamma flip — this is the
+        // choppiest zone; dealers rapidly switch between buying and selling,
+        // whipsawing price and destroying premium in both directions.
+        if (gex.FlipLevel > 0m)
+        {
+            decimal flipProximity = Math.Abs(underlyingPrice - gex.FlipLevel) / underlyingPrice;
+            if (flipProximity < NearFlipBuffer)
+            {
+                _logger.LogInformation(
+                    "GexScan [{Ticker}]: SKIP — price ${Price:F2} is within {Prox:P2} of gamma flip ${Flip:F2} " +
+                    "(chop zone — wait for a clear break).",
+                    ticker, underlyingPrice, flipProximity, gex.FlipLevel);
+                return;
+            }
+        }
+
         // ── Momentum confirmation ─────────────────────────────────────────────
         // Negative GEX means moves are amplified — but amplified in WHICH direction?
         // We only want calls when the underlying is actually trending UP.
@@ -347,7 +364,7 @@ public class GexFunction
             return;
         }
 
-        await PlaceBuyOrderAsync(ticker, best.Value.Symbol, underlyingPrice, best.Value.Ask, now, gex.NearestWallAbove);
+        await PlaceBuyOrderAsync(ticker, best.Value.Symbol, underlyingPrice, best.Value.Ask, now, gex.NearestWallAbove, gex.FlipLevel);
     }
 
     // ── Exit logic (runs every 1 min via GexExitCheck) ───────────────────────
@@ -385,6 +402,24 @@ public class GexFunction
         }
 
         decimal pnlPct = (currentPremium - pos.EntryPremium) / pos.EntryPremium;
+
+        // ── Gamma flip structural stop — underlying crossed back below flip ────
+        // When price drops below the flip level, dealers switch from dampening to
+        // amplifying downside — the structural reason for the call trade is gone.
+        if (pos.GammaFlipLevel > 0m)
+        {
+            decimal underlying = await GetLatestUnderlyingPriceAsync(ticker);
+            if (underlying > 0m && underlying < pos.GammaFlipLevel)
+            {
+                _logger.LogWarning(
+                    "GexExitCheck [{Ticker}]: EXIT — GAMMA FLIP BROKEN. underlying ${Price:F2} < flip ${Flip:F2}. " +
+                    "Dealer hedging has flipped direction — structural basis for long call is gone. premium=${Current:F2} ({Pnl:P1}).",
+                    ticker, underlying, pos.GammaFlipLevel, currentPremium, pnlPct);
+                await ClosePositionAsync(ticker, pos, now,
+                    $"GAMMA FLIP BROKEN (price ${underlying:F2} < flip ${pos.GammaFlipLevel:F2})", currentPremium);
+                return;
+            }
+        }
 
         // ── Stop loss — premium down StopLossPct from entry ─────────────────
         if (pnlPct <= -StopLossPct)
@@ -506,6 +541,7 @@ public class GexFunction
         //   strike -3% to +2% — slightly ITM to just OTM; avoids worthless far-OTM
         //   0–10 DTE          — short-dated for gamma leverage in a negative-GEX move
         //   Score: gamma/ask  — still maximises movement per dollar paid
+        var minExpiry   = DateOnly.FromDateTime(now.Date.AddDays(1));  // exclude 0 DTE — theta too destructive
         var maxExpiry   = DateOnly.FromDateTime(now.Date.AddDays(10));
         decimal floor   = Math.Round(underlyingPrice * 0.97m, 2);  // up to -3% (slightly ITM)
         decimal ceiling = Math.Round(underlyingPrice * 1.02m, 2);  // up to +2% OTM only
@@ -529,7 +565,8 @@ public class GexFunction
                     ask >= 1.00m && ask <= maxAsk      // $1–$10/share = $100–$1 000/contract
                  && delta >= 0.40m && delta <= 0.70m   // near-ATM — real directional exposure
                  && gamma > 0m
-                 && expiry <= maxExpiry                 // 0–10 DTE
+                 && expiry >= minExpiry                 // exclude 0 DTE
+                 && expiry <= maxExpiry                 // 1–10 DTE
                  && strike >= floor && strike <= ceiling; // -3% ITM to +2% OTM
 
                 bool liquid = spreadPct < maxSpreadPct;
@@ -654,29 +691,33 @@ public class GexFunction
 
     private async Task PlaceBuyOrderAsync(
         string ticker, string optionSymbol, decimal underlyingPrice,
-        decimal premium, DateTime now, decimal gexWallAbove)
+        decimal premium, DateTime now, decimal gexWallAbove, decimal gammaFlipLevel)
     {
         try
         {
             _logger.LogInformation(
-                "GexScan [{Ticker}]: submitting BUY — symbol={Symbol}  qty=1  Market  Day  gexWall={Wall}.",
-                ticker, optionSymbol, gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none");
+                "GexScan [{Ticker}]: submitting BUY — symbol={Symbol}  qty=1  Market  Day  gexWall={Wall}  gammaFlip={Flip}.",
+                ticker, optionSymbol,
+                gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none",
+                gammaFlipLevel > 0m ? $"${gammaFlipLevel:F2}" : "none");
 
             var req   = new NewOrderRequest(optionSymbol, 1, OrderSide.Buy, OrderType.Market, TimeInForce.Day);
             var order = await _tradingClient.PostOrderAsync(req);
 
             _logger.LogInformation(
                 "GexScan [{Ticker}]: ✔ BUY accepted — orderId={Id}  status={Status}  " +
-                "underlying=${Price:F2}  premium(ask)=${Premium:F2}  gexWall={Wall}  " +
-                "exit: -{Stop:P0} stop loss · trailing stop (+{Arm:P0} arms, {Step:P0} trail) · GEX wall · EOD close.",
+                "underlying=${Price:F2}  premium(ask)=${Premium:F2}  gexWall={Wall}  gammaFlip={Flip}  " +
+                "exit: flip-break · -{Stop:P0} stop · trailing (+{Arm:P0} arms, {Step:P0} trail) · GEX wall · EOD.",
                 ticker, order.OrderId, order.OrderStatus, underlyingPrice, premium,
-                gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none", StopLossPct, TrailingActivatePct, TrailingStepPct);
+                gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none",
+                gammaFlipLevel > 0m ? $"${gammaFlipLevel:F2}" : "none",
+                StopLossPct, TrailingActivatePct, TrailingStepPct);
 
-            await _positionStore.OpenAsync(ticker, optionSymbol, premium, underlyingPrice, now, gexWallAbove);
+            await _positionStore.OpenAsync(ticker, optionSymbol, premium, underlyingPrice, now, gexWallAbove, gammaFlipLevel);
 
             decimal? strike = ParseStrike(optionSymbol);
             await SendAlertAsync(ticker, optionSymbol, underlyingPrice, "ENTRY", now, isEntry: true,
-                strike: strike, premium: premium, gexWallAbove: gexWallAbove);
+                strike: strike, premium: premium, gexWallAbove: gexWallAbove, gammaFlipLevel: gammaFlipLevel);
         }
         catch (Exception ex)
         {
@@ -759,6 +800,7 @@ public class GexFunction
         string ticker, string optionSymbol, decimal underlyingPrice,
         string reason, DateTime now, bool isEntry,
         decimal? strike = null, decimal? premium = null, decimal gexWallAbove = 0m,
+        decimal gammaFlipLevel = 0m,
         decimal? entryPremium = null, decimal? exitPremium = null)
     {
         string sender     = Environment.GetEnvironmentVariable("GMAIL_SENDER")     ?? "";
@@ -799,8 +841,14 @@ public class GexFunction
                       <td style="padding:8px 16px;font-weight:bold">{(premium.HasValue ? $"${premium.Value:F2}" : "n/a")}  (cost: {(premium.HasValue ? $"${premium.Value * 100m:F2}" : "n/a")})</td></tr>
                   <tr><td style="padding:8px 16px;color:#555">GEX Wall Target</td>
                       <td style="padding:8px 16px;font-weight:bold;color:#0d6efd">{(gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none identified")}</td></tr>
-                  <tr style="background:#f9f9f9"><td style="padding:8px 16px;color:#555">Exit Plan</td>
+                  <tr style="background:#f9f9f9"><td style="padding:8px 16px;color:#555">Gamma Flip Stop</td>
+                      <td style="padding:8px 16px;font-weight:bold;color:#c0392b">
+                        {(gammaFlipLevel > 0m ? $"${gammaFlipLevel:F2}" : "n/a")}
+                        <span style="color:#888;font-size:11px"> — exit immediately if price closes below</span>
+                      </td></tr>
+                  <tr><td style="padding:8px 16px;color:#555">Exit Plan</td>
                       <td style="padding:8px 16px;color:#c0392b;font-weight:bold">
+                        Flip break (price &lt; {(gammaFlipLevel > 0m ? $"${gammaFlipLevel:F2}" : "flip")}) ·
                         Stop loss -{StopLossPct:P0} · trailing stop (+{TrailingActivatePct:P0} arms, {TrailingStepPct:P0} trail) · GEX wall exit · EOD force-close at {EodForceCloseTime}
                       </td></tr>
                   """

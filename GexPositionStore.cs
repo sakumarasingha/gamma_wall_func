@@ -20,6 +20,8 @@ public sealed class GexPositionStore
         public required DateTime EntryTime       { get; init; }
         // GEX call wall captured at entry — close when underlying approaches this level.
         public decimal           GexWallAbove    { get; init; }
+        // Gamma flip level captured at entry — exit if underlying closes below this (structural stop).
+        public decimal           GammaFlipLevel  { get; init; }
         // High-water mark used by the trailing stop (currentPremium × 0.98, ratchets up only).
         public decimal           PeakPremium     { get; set; }
         // True once premium has gained ≥ TrailingActivatePct from entry.
@@ -42,7 +44,7 @@ public sealed class GexPositionStore
 
     public Task OpenAsync(
         string ticker, string optionSymbol, decimal entryPremium,
-        decimal entryUnderlying, DateTime entryTime, decimal gexWallAbove)
+        decimal entryUnderlying, DateTime entryTime, decimal gexWallAbove, decimal gammaFlipLevel)
     {
         _cache[ticker] = new Position
         {
@@ -51,15 +53,17 @@ public sealed class GexPositionStore
             EntryUnderlying = entryUnderlying,
             EntryTime       = entryTime,
             GexWallAbove    = gexWallAbove,
+            GammaFlipLevel  = gammaFlipLevel,
             PeakPremium     = entryPremium,
             TrailingActive  = false,
         };
 
         _logger.LogInformation(
             "GexPositionStore: OPENED — {Ticker}  symbol={Symbol}  " +
-            "entryPremium=${Entry:F2}  underlying=${Price:F2}  gexWall={Wall}  openPositions={Count}.",
+            "entryPremium=${Entry:F2}  underlying=${Price:F2}  gexWall={Wall}  gammaFlip={Flip}  openPositions={Count}.",
             ticker, optionSymbol, entryPremium, entryUnderlying,
-            gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none", _cache.Count);
+            gexWallAbove > 0m ? $"${gexWallAbove:F2}" : "none",
+            gammaFlipLevel > 0m ? $"${gammaFlipLevel:F2}" : "none", _cache.Count);
 
         return Task.CompletedTask;
     }

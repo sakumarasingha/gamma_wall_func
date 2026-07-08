@@ -446,6 +446,7 @@ public class WallBounceFunction
     {
         // Near-ATM calls: delta 0.40–0.70, $1–maxAsk/share, 0–10 DTE, -3% to +2% OTM.
         // We're buying into a bounce setup — want real directional exposure, not lottery tickets.
+        var minExpiry   = DateOnly.FromDateTime(now.Date.AddDays(1));  // exclude 0 DTE — theta too destructive
         var maxExpiry   = DateOnly.FromDateTime(now.Date.AddDays(10));
         decimal floor   = Math.Round(underlyingPrice * 0.97m, 2);  // slightly ITM allowed
         decimal ceiling = Math.Round(underlyingPrice * 1.02m, 2);  // up to +2% OTM
@@ -467,7 +468,8 @@ public class WallBounceFunction
                     ask >= 1.00m && ask <= maxAsk
                  && delta >= 0.40m && delta <= 0.70m
                  && gamma > 0m
-                 && expiry <= maxExpiry
+                 && expiry >= minExpiry                 // exclude 0 DTE
+                 && expiry <= maxExpiry                 // 1–10 DTE
                  && strike >= floor && strike <= ceiling;
 
                 bool liquid = spreadPct < MaxSpreadPct;
